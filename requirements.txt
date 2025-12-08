@@ -1,0 +1,20 @@
+# Mistral OCR V13 - Dependencias Limpias
+# Generado: 2025-12-08
+# Instalacion: pip install -r requirements.txt
+
+# === CORE API ===
+mistralai>=1.0.0            # API Mistral OCR (CRITICA - AGREGADA)
+
+# === GUI Desktop ===
+customtkinter>=5.2.0        # Framework GUI moderno
+Pillow>=9.0.0               # Procesamiento de imagenes
+tkhtmlview>=0.3.1           # Preview HTML (opcional)
+
+# === Procesamiento PDF ===
+PyPDF2>=3.0.0               # Manipulacion y division de PDFs
+
+# === Utilidades ===
+python-dotenv>=1.0.0        # Variables de entorno (.env)
+markdown>=3.4.0             # Conversion markdown
+datauri>=2.0.0              # Parsing data URIs de imagenes
+requests>=2.28.0            # HTTP requests

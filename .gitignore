@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Test files
+test_*.py
+*_test.py
+*.test.py
+tests/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*_old.py
+*_backup.py
+.~*
+
+# Output files (OCR results)
+ocr_output_*.md
+ocr_output_*.txt
+imagenes_*/
+
+# Split PDF files (temporales)
+*_pag*.pdf
+*_part*.pdf
+*_split*.pdf
+
+# Cache
+.cache/
+*.cache
+
+# Backups de purga
+_FINAL_BACKUP_*/
+_BACKUP_*/
+PURGE_ANALYSIS.md
+purge_application.py
+EJECUTAR_PURGA.bat
