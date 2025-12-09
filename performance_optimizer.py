@@ -7,6 +7,7 @@ Implementa estrategias avanzadas para maximizar velocidad de procesamiento.
 import time
 import asyncio
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Callable, Optional, Tuple
 from dataclasses import dataclass
@@ -42,12 +43,13 @@ class BatchProcessor:
         self.ocr_client = ocr_client
         self.max_workers = max_workers  # Reducido para evitar rate limits
         self.metrics = []
-        
-        # Configuración de delays adaptativos
-        self.base_delay = 2.0  # Delay base entre requests
+
+        # Configuración de delays adaptativos mejorada
+        self.base_delay = 1.5  # Delay base entre requests (reducido de 2.0s)
         self.adaptive_delay = self.base_delay
         self.rate_limit_backoff = 1.5  # Factor de backoff
-        
+        self.adaptive_reduction_factor = 0.9  # Factor de reducción (más agresivo, era 0.95)
+
         # Cache de archivos subidos
         self.upload_cache = {}
     
@@ -133,6 +135,15 @@ class BatchProcessor:
             return min(3, file_count)  # Archivos medianos: máximo 3
         else:
             return min(4, file_count)  # Archivos pequeños: máximo 4
+
+    def _get_delay_for_file(self, file_size_mb: float) -> float:
+        """Calcula delay adaptativo basado en tamaño del archivo."""
+        if file_size_mb < 5:
+            return 0.5  # Archivos pequeños: delay mínimo
+        elif file_size_mb < 30:
+            return 1.5  # Archivos medianos: delay moderado
+        else:
+            return 4.0  # Archivos grandes: delay mayor para evitar saturación
     
     def _process_group_concurrent(self, files_group: List[Dict], config: Dict,
                                 workers: int, progress_callback: Callable) -> Dict:
@@ -143,14 +154,19 @@ class BatchProcessor:
             return results
         
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            # Enviar tareas con delay escalonado
+            # Enviar tareas con delay escalonado basado en tamaño
             futures = {}
-            
+
             for i, file_info in enumerate(files_group):
-                # Delay escalonado para evitar burst de requests
+                # Delay adaptativo basado en tamaño del archivo
                 if i > 0:
-                    time.sleep(self.adaptive_delay)
-                
+                    file_size_mb = file_info.get('size_mb', 0)
+                    size_based_delay = self._get_delay_for_file(file_size_mb)
+                    # Combinar con delay adaptativo (usar el mayor)
+                    effective_delay = max(size_based_delay, self.adaptive_delay)
+                    logger.debug(f"Delay para {file_info['file_path']}: {effective_delay:.1f}s (tamaño: {file_size_mb:.1f}MB)")
+                    time.sleep(effective_delay)
+
                 future = executor.submit(
                     self._process_single_file_with_metrics,
                     file_info, config
@@ -165,9 +181,9 @@ class BatchProcessor:
                 try:
                     result = future.result()
                     results['success'].append(result)
-                    
-                    # Actualizar delay adaptativo (éxito = reducir delay)
-                    self.adaptive_delay = max(1.0, self.adaptive_delay * 0.95)
+
+                    # Actualizar delay adaptativo (éxito = reducir delay) - factor más agresivo
+                    self.adaptive_delay = max(0.5, self.adaptive_delay * self.adaptive_reduction_factor)
                     
                 except Exception as e:
                     error_str = str(e)
@@ -280,26 +296,34 @@ class BatchProcessor:
                 raise
     
     def _upload_file_cached(self, file_path: str, force_fresh: bool = False) -> str:
-        """Sube archivo con sistema de cache para evitar re-subidas."""
+        """Sube archivo con sistema de cache mejorado para evitar re-subidas."""
         file_path = Path(file_path)
-        file_key = f"{file_path.name}_{file_path.stat().st_mtime}_{file_path.stat().st_size}"
-        
-        # Verificar cache (solo si no forzamos subida fresca)
-        if not force_fresh and file_key in self.upload_cache:
-            cache_entry = self.upload_cache[file_key]
-            # Verificar si no ha expirado (URLs válidas por 24 horas)
-            if time.time() - cache_entry['timestamp'] < 21600:  # 6 horas conservador
-                logger.info(f"Usando URL cacheada para {file_path.name}")
-                return cache_entry['url']
-        
-        # Subir archivo
-        logger.info(f"Subiendo {'(forzado)' if force_fresh else ''} {file_path.name} ({file_path.stat().st_size/(1024*1024):.1f} MB)")
+
+        # Limpiar cache de entradas expiradas periódicamente
+        self._cleanup_expired_cache()
+
+        # Usar hash MD5 como clave primaria (detecta duplicados independiente del nombre)
         content = file_path.read_bytes()
+        file_hash = hashlib.md5(content).hexdigest()
+
+        # Verificar cache (solo si no forzamos subida fresca)
+        if not force_fresh and file_hash in self.upload_cache:
+            cache_entry = self.upload_cache[file_hash]
+            # Verificar si no ha expirado (URLs válidas por 24 horas, usar 12 horas para seguridad)
+            if time.time() - cache_entry['timestamp'] < 43200:  # 12 horas (mejorado desde 6)
+                logger.info(f"✓ Usando URL cacheada para {file_path.name} (hash: {file_hash[:8]}...)")
+                return cache_entry['url']
+            else:
+                logger.info(f"Cache expirado para {file_path.name}, subiendo de nuevo")
+                del self.upload_cache[file_hash]
+
+        # Subir archivo
+        logger.info(f"Subiendo {'(forzado)' if force_fresh else ''} {file_path.name} ({len(content)/(1024*1024):.1f} MB)")
         uploaded = self.ocr_client.client.files.upload(
             file={"file_name": file_path.name, "content": content},
             purpose="ocr"
         )
-        
+
         # Aumentar tiempo de expiración y añadir retry
         max_retries = 3
         for attempt in range(max_retries):
@@ -313,14 +337,32 @@ class BatchProcessor:
                     raise
                 logger.warning(f"Error obteniendo URL firmada (intento {attempt + 1}): {e}")
                 time.sleep(2 ** attempt)  # Backoff exponencial
-        
-        # Guardar en cache
-        self.upload_cache[file_key] = {
+
+        # Guardar en cache con hash MD5 y metadata adicional
+        self.upload_cache[file_hash] = {
             'url': signed_url.url,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'filename': file_path.name,
+            'size_mb': len(content) / (1024 * 1024)
         }
-        
+
+        logger.info(f"✓ Archivo cacheado (hash: {file_hash[:8]}..., válido por 12 horas)")
+
         return signed_url.url
+
+    def _cleanup_expired_cache(self):
+        """Limpia entradas de cache expiradas (>12 horas)."""
+        current_time = time.time()
+        expired_keys = [
+            key for key, entry in self.upload_cache.items()
+            if current_time - entry['timestamp'] > 43200  # 12 horas
+        ]
+
+        if expired_keys:
+            for key in expired_keys:
+                filename = self.upload_cache[key].get('filename', 'unknown')
+                del self.upload_cache[key]
+            logger.info(f"Limpiadas {len(expired_keys)} entradas expiradas del cache")
     
     def _save_results_optimized(self, response, file_info: Dict, 
                               config: Dict, page_offset: int) -> Dict:
@@ -355,8 +397,8 @@ class BatchProcessor:
         if config.get('save_images', False):
             save_tasks.append(('images', f"{base_name}_images"))
         
-        # Ejecutar guardado en paralelo
-        with ThreadPoolExecutor(max_workers=3) as save_executor:
+        # Ejecutar guardado en paralelo con más workers para mayor velocidad
+        with ThreadPoolExecutor(max_workers=5) as save_executor:
             save_futures = {}
             
             for save_type, filename in save_tasks:
@@ -438,27 +480,27 @@ class PerformanceConfig:
         """Obtiene configuración óptima basada en el lote."""
         config = {
             'max_workers': 3,
-            'base_delay': 2.0,
+            'base_delay': 1.5,  # Reducido de 2.0s
             'enable_cache': True,
             'parallel_save': True
         }
-        
+
         # Ajustar según tamaño del lote
         if file_count > 10:
             config['max_workers'] = 2  # Reducir concurrencia para lotes grandes
-            config['base_delay'] = 3.0
+            config['base_delay'] = 2.5  # Reducido de 3.0s
         elif file_count < 3:
             config['max_workers'] = 4  # Aumentar para lotes pequeños
-            config['base_delay'] = 1.5
-        
+            config['base_delay'] = 1.0  # Reducido de 1.5s
+
         # Ajustar según tamaño total
         if total_size_mb > 500:  # Lote muy grande
             config['max_workers'] = 2
-            config['base_delay'] = 4.0
+            config['base_delay'] = 3.5  # Reducido de 4.0s
         elif total_size_mb < 50:  # Lote pequeño
             config['max_workers'] = 4
-            config['base_delay'] = 1.0
-        
+            config['base_delay'] = 0.5  # Reducido de 1.0s - archivos pequeños pueden ir más rápido
+
         return config
     
     @staticmethod

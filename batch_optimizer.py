@@ -48,15 +48,15 @@ class SplitRecommendation:
 
 class BatchOptimizer:
     """Optimizador inteligente para procesamiento por lotes."""
-    
-    # Límites de la API
-    MAX_SIZE_MB = 45.0  # Restaurado al valor que funcionaba perfectamente
-    MAX_PAGES = 135     # Ajustado proporcionalmente (45/50 * 150 = 135)
-    
-    # Factores de seguridad
-    SAFETY_FACTOR_SIZE = 0.95  # 95% del límite para margen de seguridad
-    SAFETY_FACTOR_PAGES = 0.97  # 97% del límite de páginas
-    
+
+    # Límites de la API (optimizados para mejor rendimiento)
+    MAX_SIZE_MB = 48.0  # Aumentado de 45MB a 48MB (96% del límite API de 50MB)
+    MAX_PAGES = 145     # Aumentado de 135 a 145 páginas (97% del límite API de 150)
+
+    # Factores de seguridad (un solo margen, más eficiente)
+    SAFETY_FACTOR_SIZE = 0.97  # 97% del límite (aumentado de 95%)
+    SAFETY_FACTOR_PAGES = 0.97  # 97% del límite de páginas (sin cambio)
+
     # Overhead estimado por archivo PDF
     PDF_OVERHEAD_MB = 0.5
     
