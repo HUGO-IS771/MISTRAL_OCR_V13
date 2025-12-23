@@ -394,6 +394,9 @@ class BatchProcessor:
         if config.get('save_txt', False):
             save_tasks.append(('txt', f"{base_name}.txt"))
         
+        if config.get('save_html', False):
+            save_tasks.append(('html', f"{base_name}.html"))
+        
         if config.get('save_images', False):
             save_tasks.append(('images', f"{base_name}_images"))
         
@@ -404,7 +407,7 @@ class BatchProcessor:
             for save_type, filename in save_tasks:
                 future = save_executor.submit(
                     self._save_single_format,
-                    response, save_type, output_dir, filename, page_offset
+                    response, save_type, output_dir, filename, page_offset, base_name
                 )
                 save_futures[future] = (save_type, filename)
             
@@ -420,7 +423,7 @@ class BatchProcessor:
         return saved_files
     
     def _save_single_format(self, response, save_type: str, output_dir: str,
-                          filename: str, page_offset: int) -> str:
+                          filename: str, page_offset: int, title: str = None) -> str:
         """Guarda un formato específico."""
         output_path = Path(output_dir) / filename
         
@@ -428,6 +431,10 @@ class BatchProcessor:
             return self.ocr_client.save_as_markdown(response, output_path, page_offset)
         elif save_type == 'txt':
             return self.ocr_client.save_text(response, output_path, page_offset)
+        elif save_type == 'html':
+            # Usar el título formateado o el nombre del archivo
+            doc_title = title.replace('_', ' ').title() if title else "Documento OCR"
+            return self.ocr_client.save_as_html(response, output_path, page_offset, title=doc_title)
         elif save_type == 'images':
             return self.ocr_client.save_images(response, output_path, page_offset)
         

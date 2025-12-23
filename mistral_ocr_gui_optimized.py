@@ -101,7 +101,7 @@ class ProcessingConfig:
     
     def __post_init__(self):
         if self.output_formats is None:
-            self.output_formats = ['md', 'txt']
+            self.output_formats = ['md', 'txt', 'html']
 
 
 class WidgetFactory:
@@ -516,6 +516,7 @@ class MistralOCRApp(ctk.CTk):
                 'md': tk.BooleanVar(value=True),
                 'md_rich': tk.BooleanVar(value=False),
                 'txt': tk.BooleanVar(value=True),
+                'html': tk.BooleanVar(value=True),
                 'pdf': tk.BooleanVar(value=False),
                 'images': tk.BooleanVar(value=False)
             },
@@ -581,8 +582,9 @@ class MistralOCRApp(ctk.CTk):
             ("Markdown", self.batch_vars['formats']['md']),
             ("Markdown enriquecido", self.batch_vars['formats']['md_rich']),
             ("Texto", self.batch_vars['formats']['txt']),
+            ("🌐 HTML (con imágenes incrustadas)", self.batch_vars['formats']['html']),
             ("PDF", self.batch_vars['formats']['pdf']),
-            ("Imágenes", self.batch_vars['formats']['images']),
+            ("Imágenes separadas", self.batch_vars['formats']['images']),
             ("Optimizar texto", self.batch_vars['optimize']['enabled'])
         ]
         self.widget_factory.create_checkbox_group(format_frame, formats).pack(
@@ -1349,6 +1351,7 @@ class MistralOCRApp(ctk.CTk):
             'output_dir': output_dir,
             'save_md': 'md' in config.output_formats,
             'save_txt': 'txt' in config.output_formats,
+            'save_html': 'html' in config.output_formats,
             'save_images': 'images' in config.output_formats
         }
         

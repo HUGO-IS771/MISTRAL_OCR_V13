@@ -164,6 +164,14 @@ client.save_as_markdown(
     domain="legal",  # or "medical", "technical", "general"
     enrich_images=True
 )
+
+# Export to premium HTML with embedded images
+client.save_as_html(
+    response,
+    "output.html",
+    title="Mi Documento",
+    theme="light"  # or "dark"
+)
 ```
 
 ### Batch Processing Example

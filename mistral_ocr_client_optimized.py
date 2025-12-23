@@ -231,6 +231,667 @@ class MistralOCRClient:
         logger.info(f"Imágenes guardadas: {saved_count} en {output_dir}")
         return output_dir
     
+    def save_as_html(self, ocr_response, output_path=None, page_offset=0,
+                     optimize=False, domain="general", title="Documento OCR",
+                     theme="light"):
+        """
+        Guarda el documento como HTML premium con imágenes incrustadas.
+        
+        Args:
+            ocr_response: Respuesta OCR de Mistral
+            output_path: Ruta de salida (opcional)
+            page_offset: Offset para numeración de páginas
+            optimize: Aplicar optimización de texto
+            domain: Dominio de optimización
+            title: Título del documento HTML
+            theme: 'light' o 'dark' para el tema visual
+            
+        Returns:
+            Path: Ruta del archivo HTML generado
+        """
+        output_path = self._prepare_output_path(output_path, "html")
+        
+        # Generar contenido HTML directamente (no usar markdown para imágenes)
+        html_body = self._generate_html_content_with_images(
+            ocr_response, page_offset, optimize, domain
+        )
+        
+        # Generar HTML completo con estilos premium
+        html_content = self._generate_premium_html(
+            html_body, title, theme, 
+            total_pages=len(ocr_response.pages),
+            total_images=sum(len(p.images) for p in ocr_response.pages)
+        )
+        
+        # Guardar archivo
+        with open(output_path, "wt", encoding="utf-8") as f:
+            f.write(html_content)
+        
+        logger.info(f"HTML guardado: {output_path}")
+        return output_path
+    
+    def _generate_html_content_with_images(self, ocr_response, page_offset: int,
+                                           optimize: bool, domain: str) -> str:
+        """
+        Genera contenido markdown con imágenes incrustadas como data URIs.
+        El markdown será procesado por marked.js en el navegador.
+        """
+        from text_md_optimization import MarkdownOptimizer
+        
+        optimizer = MarkdownOptimizer(domain) if optimize else None
+        markdown_parts = []
+        
+        for i, page in enumerate(ocr_response.pages):
+            page_num = i + 1 + page_offset
+            markdown_parts.append(f'\n\n---\n\n## 📄 Página {page_num}\n\n')
+            
+            # Obtener markdown de la página
+            page_content = page.markdown
+            
+            # Optimizar si se solicita
+            if optimizer:
+                page_content = optimizer.optimize_markdown(page_content)
+            
+            # Crear diccionario de imágenes con sus data URIs
+            image_data_map = {}
+            for img in page.images:
+                img_data, extension = self.image_processor.extract_image_data(img)
+                if img_data and hasattr(img, 'id'):
+                    # Crear data URI completo
+                    mime_type = f"image/{extension}" if extension != 'jpg' else "image/jpeg"
+                    data_uri = f"data:{mime_type};base64,{base64.b64encode(img_data).decode()}"
+                    image_data_map[img.id] = data_uri
+            
+            # Reemplazar referencias de imágenes con data URIs
+            for img_id, data_uri in image_data_map.items():
+                # Reemplazar ![id](id) con ![id](data:...)
+                page_content = page_content.replace(
+                    f"![{img_id}]({img_id})",
+                    f"![{img_id}]({data_uri})"
+                )
+            
+            markdown_parts.append(page_content)
+        
+        # Unir todo el contenido markdown
+        full_markdown = '\n'.join(markdown_parts)
+        
+        # Escapar caracteres especiales para JavaScript
+        escaped_markdown = (full_markdown
+            .replace('\\', '\\\\')
+            .replace('`', '\\`')
+            .replace('$', '\\$')
+            .replace('</script>', '<\\/script>')
+        )
+        
+        return escaped_markdown
+    
+    def _generate_premium_html(self, body_content: str, title: str, theme: str,
+                               total_pages: int, total_images: int) -> str:
+        """Genera HTML completo con estilos premium."""
+        
+        # Colores según tema
+        if theme == "dark":
+            bg_color = "#1a1a2e"
+            text_color = "#eaeaea"
+            card_bg = "#16213e"
+            accent_color = "#0f3460"
+            border_color = "#0f3460"
+            header_bg = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
+            table_header_bg = "#0f3460"
+            table_alt_bg = "#1a1a2e"
+            link_color = "#64b5f6"
+            code_bg = "#0d1117"
+        else:
+            bg_color = "#f8fafc"
+            text_color = "#1e293b"
+            card_bg = "#ffffff"
+            accent_color = "#3b82f6"
+            border_color = "#e2e8f0"
+            header_bg = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
+            table_header_bg = "#f1f5f9"
+            table_alt_bg = "#f8fafc"
+            link_color = "#2563eb"
+            code_bg = "#f1f5f9"
+        
+        html_template = f'''<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="Mistral OCR Client v4.0">
+    <meta name="description" content="Documento procesado con Mistral OCR - {total_pages} páginas">
+    <title>{title}</title>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <style>
+        /* === Reset & Base === */
+        *, *::before, *::after {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        
+        html {{
+            scroll-behavior: smooth;
+        }}
+        
+        body {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: {bg_color};
+            color: {text_color};
+            line-height: 1.7;
+            font-size: 16px;
+            min-height: 100vh;
+        }}
+        
+        /* === Header Premium === */
+        .header {{
+            background: {header_bg};
+            color: white;
+            padding: 2.5rem 2rem;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }}
+        
+        .header::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Cpath d='m36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+            opacity: 0.5;
+        }}
+        
+        .header h1 {{
+            font-size: 2.25rem;
+            font-weight: 700;
+            margin-bottom: 0.75rem;
+            position: relative;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        
+        .header-meta {{
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            font-size: 0.9rem;
+            opacity: 0.9;
+            position: relative;
+        }}
+        
+        .header-meta span {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        
+        /* === Main Content === */
+        .container {{
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
+        }}
+        
+        .content {{
+            background: {card_bg};
+            border-radius: 16px;
+            padding: 3rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 
+                        0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            border: 1px solid {border_color};
+        }}
+        
+        /* === Typography === */
+        h1, h2, h3, h4, h5, h6 {{
+            font-weight: 600;
+            margin-top: 2rem;
+            margin-bottom: 1rem;
+            color: {text_color};
+        }}
+        
+        h1 {{ font-size: 2rem; border-bottom: 3px solid {accent_color}; padding-bottom: 0.5rem; }}
+        h2 {{ font-size: 1.5rem; border-bottom: 2px solid {border_color}; padding-bottom: 0.4rem; }}
+        h3 {{ font-size: 1.25rem; }}
+        h4 {{ font-size: 1.1rem; }}
+        
+        p {{
+            margin-bottom: 1.25rem;
+            text-align: justify;
+            hyphens: auto;
+        }}
+        
+        a {{
+            color: {link_color};
+            text-decoration: none;
+            border-bottom: 1px solid transparent;
+            transition: border-color 0.2s ease;
+        }}
+        
+        a:hover {{
+            border-bottom-color: {link_color};
+        }}
+        
+        /* === Images === */
+        img {{
+            max-width: 100%;
+            height: auto;
+            border-radius: 12px;
+            margin: 1.5rem auto;
+            display: block;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.15);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }}
+        
+        img:hover {{
+            transform: scale(1.02);
+            box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.2);
+        }}
+        
+        /* === OCR Images with Figures === */
+        .ocr-image {{
+            margin: 2rem 0;
+            text-align: center;
+            background: {table_alt_bg};
+            padding: 1.5rem;
+            border-radius: 16px;
+            border: 1px solid {border_color};
+        }}
+        
+        .ocr-image img {{
+            max-width: 100%;
+            height: auto;
+            margin: 0 auto 1rem auto;
+            border-radius: 8px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+        }}
+        
+        .ocr-image figcaption {{
+            font-size: 0.85rem;
+            color: {text_color}99;
+            font-style: italic;
+            margin-top: 0.75rem;
+        }}
+        
+        /* === Page Headers === */
+        .page-header {{
+            background: linear-gradient(90deg, {accent_color}20, transparent);
+            padding: 0.75rem 1.5rem;
+            border-left: 4px solid {accent_color};
+            margin: 2.5rem 0 1.5rem 0;
+            border-radius: 0 8px 8px 0;
+        }}
+        
+        /* === Page Separators === */
+        .page-separator {{
+            border: none;
+            height: 3px;
+            background: linear-gradient(90deg, transparent, {accent_color}50, transparent);
+            margin: 3rem 0;
+        }}
+        
+        /* === Tables Premium === */
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 2rem 0;
+            font-size: 0.95rem;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+        }}
+        
+        thead {{
+            background: {table_header_bg};
+        }}
+        
+        th {{
+            padding: 1rem 1.25rem;
+            text-align: left;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 0.05em;
+            border-bottom: 2px solid {accent_color};
+        }}
+        
+        td {{
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid {border_color};
+            vertical-align: top;
+        }}
+        
+        tbody tr {{
+            transition: background-color 0.15s ease;
+        }}
+        
+        tbody tr:nth-child(even) {{
+            background-color: {table_alt_bg};
+        }}
+        
+        tbody tr:hover {{
+            background-color: {accent_color}15;
+        }}
+        
+        /* === Code Blocks === */
+        code {{
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            background: {code_bg};
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            font-size: 0.9em;
+        }}
+        
+        pre {{
+            background: {code_bg};
+            padding: 1.5rem;
+            border-radius: 12px;
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            border: 1px solid {border_color};
+        }}
+        
+        pre code {{
+            background: none;
+            padding: 0;
+        }}
+        
+        /* === Lists === */
+        ul, ol {{
+            margin: 1rem 0 1.5rem 2rem;
+        }}
+        
+        li {{
+            margin-bottom: 0.5rem;
+        }}
+        
+        /* === Blockquotes === */
+        blockquote {{
+            border-left: 4px solid {accent_color};
+            margin: 1.5rem 0;
+            padding: 1rem 1.5rem;
+            background: {accent_color}10;
+            border-radius: 0 12px 12px 0;
+            font-style: italic;
+        }}
+        
+        /* === Page Separator === */
+        hr {{
+            border: none;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, {accent_color}, transparent);
+            margin: 3rem 0;
+        }}
+        
+        hr.page-separator {{
+            height: 3px;
+            margin: 4rem 0;
+            background: linear-gradient(90deg, transparent 5%, {accent_color}40 50%, transparent 95%);
+        }}
+        
+        /* === GFM Tables (from marked.js) === */
+        .gfm-table {{
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            margin: 2rem 0;
+            font-size: 0.95rem;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            border: 1px solid {border_color};
+        }}
+        
+        .gfm-table thead {{
+            background: linear-gradient(135deg, {accent_color}15, {accent_color}05);
+        }}
+        
+        .gfm-table th {{
+            padding: 1rem 1.25rem;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.85rem;
+            letter-spacing: 0.03em;
+            border-bottom: 2px solid {accent_color};
+            color: {text_color};
+        }}
+        
+        .gfm-table td {{
+            padding: 0.875rem 1.25rem;
+            border-bottom: 1px solid {border_color};
+            vertical-align: top;
+        }}
+        
+        .gfm-table tbody tr {{
+            transition: background-color 0.15s ease;
+        }}
+        
+        .gfm-table tbody tr:nth-child(even) {{
+            background-color: {table_alt_bg};
+        }}
+        
+        .gfm-table tbody tr:hover {{
+            background-color: {accent_color}08;
+        }}
+        
+        .gfm-table tbody tr:last-child td {{
+            border-bottom: none;
+        }}
+        
+        /* Responsive table wrapper */
+        .table-wrapper {{
+            overflow-x: auto;
+            margin: 2rem 0;
+            border-radius: 12px;
+        }}
+        
+        /* === Footer === */
+        .footer {{
+            text-align: center;
+            padding: 2rem;
+            color: {text_color}80;
+            font-size: 0.85rem;
+        }}
+        
+        .footer a {{
+            color: {accent_color};
+        }}
+        
+        /* === Print Styles === */
+        @media print {{
+            .header {{
+                background: #667eea !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }}
+            
+            .content {{
+                box-shadow: none;
+                border: 1px solid #ddd;
+            }}
+            
+            img {{
+                max-width: 80%;
+                page-break-inside: avoid;
+            }}
+            
+            h1, h2, h3 {{
+                page-break-after: avoid;
+            }}
+            
+            table {{
+                page-break-inside: avoid;
+            }}
+        }}
+        
+        /* === Responsive === */
+        @media (max-width: 768px) {{
+            .container {{
+                padding: 1rem;
+            }}
+            
+            .content {{
+                padding: 1.5rem;
+                border-radius: 12px;
+            }}
+            
+            .header {{
+                padding: 1.5rem 1rem;
+            }}
+            
+            .header h1 {{
+                font-size: 1.5rem;
+            }}
+            
+            .header-meta {{
+                flex-direction: column;
+                gap: 0.5rem;
+            }}
+            
+            table {{
+                font-size: 0.85rem;
+            }}
+            
+            th, td {{
+                padding: 0.75rem;
+            }}
+        }}
+        
+        /* === Animations === */
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(20px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        
+        .content {{
+            animation: fadeIn 0.5s ease-out;
+        }}
+        
+        /* === Loading State === */
+        .loading {{
+            text-align: center;
+            padding: 3rem;
+            color: {text_color}80;
+        }}
+        
+        .loading::after {{
+            content: '';
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid {accent_color};
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+            vertical-align: middle;
+        }}
+        
+        @keyframes spin {{
+            to {{ transform: rotate(360deg); }}
+        }}
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>📄 {title}</h1>
+        <div class="header-meta">
+            <span>📑 {total_pages} página{"s" if total_pages != 1 else ""}</span>
+            <span>🖼️ {total_images} imagen{"es" if total_images != 1 else ""}</span>
+            <span>⚡ Procesado con Mistral OCR</span>
+        </div>
+    </header>
+    
+    <main class="container">
+        <article class="content" id="markdown-content">
+            <div class="loading">Renderizando documento...</div>
+        </article>
+    </main>
+    
+    <footer class="footer">
+        <p>Generado con <strong>Mistral OCR Client v4.0</strong> • 
+        <a href="https://docs.mistral.ai/" target="_blank">Documentación Mistral AI</a></p>
+    </footer>
+    
+    <!-- Marked.js desde CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    
+    <script>
+        // Contenido Markdown con imágenes incrustadas
+        const markdownContent = `{body_content}`;
+        
+        // Configurar marked para GFM (GitHub Flavored Markdown)
+        marked.setOptions({{
+            gfm: true,           // GitHub Flavored Markdown
+            breaks: true,        // Saltos de línea como <br>
+            headerIds: true,     // IDs en encabezados
+            mangle: false,       // No codificar emails
+            pedantic: false,
+            smartLists: true,
+            smartypants: true    // Tipografía inteligente
+        }});
+        
+        // Renderizar el markdown
+        document.addEventListener('DOMContentLoaded', function() {{
+            const container = document.getElementById('markdown-content');
+            
+            try {{
+                container.innerHTML = marked.parse(markdownContent);
+                
+                // Post-procesamiento: añadir clases a elementos
+                
+                // Estilizar tablas
+                container.querySelectorAll('table').forEach(table => {{
+                    table.classList.add('gfm-table');
+                }});
+                
+                // Estilizar imágenes
+                container.querySelectorAll('img').forEach(img => {{
+                    img.loading = 'lazy';
+                    img.style.cursor = 'zoom-in';
+                    
+                    // Lightbox al hacer clic
+                    img.addEventListener('click', function() {{
+                        const overlay = document.createElement('div');
+                        overlay.style.cssText = `
+                            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                            background: rgba(0,0,0,0.9); display: flex;
+                            justify-content: center; align-items: center;
+                            z-index: 9999; cursor: zoom-out;
+                        `;
+                        const enlargedImg = this.cloneNode();
+                        enlargedImg.style.cssText = `
+                            max-width: 95%; max-height: 95%; object-fit: contain;
+                            border-radius: 8px; box-shadow: 0 0 50px rgba(0,0,0,0.5);
+                        `;
+                        overlay.appendChild(enlargedImg);
+                        overlay.addEventListener('click', () => overlay.remove());
+                        document.body.appendChild(overlay);
+                    }});
+                }});
+                
+                // Estilizar separadores horizontales
+                container.querySelectorAll('hr').forEach(hr => {{
+                    hr.classList.add('page-separator');
+                }});
+                
+            }} catch (error) {{
+                container.innerHTML = '<p style="color: red;">Error al renderizar el documento: ' + error.message + '</p>';
+                console.error('Error renderizando markdown:', error);
+            }}
+        }});
+    </script>
+</body>
+</html>'''
+        
+        return html_template
+    
     # === Procesamiento por lotes optimizado ===
     
     def process_batch(self, file_paths: List[str], model="mistral-ocr-latest",
@@ -562,6 +1223,13 @@ class MistralOCRClient:
         if 'images' in formats:
             path = output_dir / f"{base_name}_images"
             outputs['images'] = self.save_images(response, path, page_offset)
+        
+        if 'html' in formats:
+            path = output_dir / f"{base_name}.html"
+            outputs['html'] = self.save_as_html(
+                response, path, page_offset, 
+                title=base_name.replace('_', ' ').title()
+            )
         
         return outputs
     
