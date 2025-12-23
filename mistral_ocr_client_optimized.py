@@ -664,9 +664,12 @@ class MistralOCRClient:
         try:
             from PyPDF2 import PdfReader
             if Path(file_path).suffix.lower() == '.pdf':
-                return len(PdfReader(file_path).pages)
-        except:
-            pass
+                reader = PdfReader(file_path)
+                pages = len(reader.pages)
+                logger.info(f"PDF analizado: {Path(file_path).name} tiene {pages} páginas")
+                return pages
+        except Exception as e:
+            logger.warning(f"No se pudo contar páginas de {Path(file_path).name}: {e}")
         return None
     
     def get_text(self, ocr_response) -> str:

@@ -90,7 +90,7 @@ SUPPORTED_FORMATS = [
 class ProcessingConfig:
     """Configuración para el procesamiento de documentos"""
     api_key: str
-    model: str = "mistral-ocr-latest"
+    model: str = "mistral-ocr-2512"
     max_size_mb: float = MAX_FILE_SIZE_MB
     max_pages: int = MAX_PAGES_PER_FILE
     compression_quality: str = "medium"
@@ -205,15 +205,19 @@ class FileProcessor:
             pages_count = self.ocr_client.estimate_pages_count(filepath)
             mime_type, _ = mimetypes.guess_type(filepath)
             
+            # Determinar si requiere división:
+            # - Por páginas: si excede MAX_PAGES_PER_FILE
+            # - Por tamaño: si excede MAX_FILE_SIZE_MB (aunque no se puedan contar páginas)
+            requires_split = size_mb > MAX_FILE_SIZE_MB
+            if pages_count is not None:
+                requires_split = requires_split or pages_count > MAX_PAGES_PER_FILE
+            
             return {
                 'path': filepath,
                 'size_mb': size_mb,
                 'pages': pages_count,
                 'mime_type': mime_type,
-                'requires_split': pages_count and (
-                    pages_count > MAX_PAGES_PER_FILE or 
-                    size_mb > MAX_FILE_SIZE_MB
-                )
+                'requires_split': requires_split
             }
         except Exception as e:
             logger.error(f"Error analyzing file {filepath}: {e}")
@@ -229,9 +233,23 @@ class FileProcessor:
                 num_files_target = self.target_files_from_modal
                 logger.info(f"Usando configuración del modal: {num_files_target} archivos")
             else:
-                # Calcular basado en páginas máximas
-                total_pages = file_info.get('pages', 1000)
-                num_files_target = math.ceil(total_pages / config.max_pages)
+                # Calcular basado en páginas máximas o tamaño si no hay páginas
+                total_pages = file_info.get('pages')
+                size_mb = file_info.get('size_mb', 0)
+                
+                if total_pages is not None:
+                    # Calcular por páginas
+                    num_files_by_pages = math.ceil(total_pages / config.max_pages)
+                else:
+                    # Si no hay páginas, estimar por tamaño (asumiendo ~0.5MB por cada 10 páginas típicamente)
+                    num_files_by_pages = 1
+                
+                # Calcular también por tamaño
+                num_files_by_size = math.ceil(size_mb / config.max_size_mb)
+                
+                # Usar el mayor de ambos para garantizar que todos los archivos estén dentro de límites
+                num_files_target = max(num_files_by_pages, num_files_by_size, 1)
+                logger.info(f"División calculada: {num_files_target} archivos (por páginas: {num_files_by_pages}, por tamaño: {num_files_by_size})")
             
             # VALIDACIÓN PRE-DIVISIÓN: Estimar tamaños ANTES de crear archivos
             try:
@@ -291,7 +309,12 @@ class FileProcessor:
                 self.target_files_from_modal = None
             
             # Ahora SÍ crear archivos físicos (ya pre-validados)
-            total_pages = file_info.get('pages', 1000)
+            # Si no tenemos páginas, estimar basándose en tamaño (~4 páginas/MB típicamente)
+            total_pages = file_info.get('pages')
+            if total_pages is None:
+                size_mb = file_info.get('size_mb', 50)
+                total_pages = int(size_mb * 4)  # Estimación conservadora
+                logger.info(f"Páginas estimadas por tamaño: {total_pages} (basado en {size_mb:.1f}MB)")
             pages_per_file = math.ceil(total_pages / num_files_target)
             
             split_info = self.ocr_client.split_pdf(
@@ -1217,7 +1240,7 @@ class MistralOCRApp(ctk.CTk):
                             all_files_to_process.append(file_dict)
                             
                             # Incrementar offset con las páginas de ESTA parte específica
-                            if 'pages' in file_dict:
+                            if 'pages' in file_dict and file_dict['pages'] is not None:
                                 current_page_offset += file_dict['pages']
                             
                     except Exception as e:
