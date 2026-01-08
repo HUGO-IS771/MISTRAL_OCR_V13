@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(for f in \"c:\\\\Users\\\\Hugo Vasquez\\\\Dropbox\\\\SCRIPTS DE PYTHON\\\\MISTRAL OCR V13 GENIAL\"/*.py)",
+      "Bash(do wc -l \"$f\")",
+      "Bash(done)",
+      "Bash(python -c:*)",
+      "Bash(for f in \"c:\\\\Users\\\\Hugo Vasquez\\\\Dropbox\\\\SCRIPTS DE PYTHON\\\\MISTRAL OCR V13 GENIAL\"/{performance_optimizer.py,multi_batch_processor.py,batch_processor.py})",
+      "Bash(for:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(python mistral_ocr_gui_optimized.py:*)",
+      "Bash(python processing_limits.py:*)",
+      "Bash(python test_cleanup_preprocessed.py:*)",
+      "Bash(timeout:*)",
+      "Bash(curl:*)",
+      "Bash(cat:*)",
+      "Bash(python bbox_annotations.py:*)",
+      "Bash(python test_escape_references.py:*)"
+    ]
+  }
+}

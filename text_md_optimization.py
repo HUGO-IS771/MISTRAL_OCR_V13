@@ -2,6 +2,8 @@
 """
 Optimización de texto y markdown para documentos OCR.
 Proporciona funcionalidad real de limpieza y mejora de texto.
+
+Incluye soporte especializado para documentos legales (domain="legal").
 """
 
 import re
@@ -9,6 +11,14 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Intentar importar formateador de documentos legales
+try:
+    from legal_document_formatter import LegalTextOptimizer
+    LEGAL_FORMATTER_AVAILABLE = True
+except ImportError:
+    LEGAL_FORMATTER_AVAILABLE = False
+    logger.warning("Formateador legal no disponible (legal_document_formatter no encontrado)")
 
 # Intentar importar validación lingüística (opcional)
 try:
@@ -54,6 +64,17 @@ class TextOptimizer:
                 self.use_linguistic_validation = False
         else:
             logger.info("Validación lingüística desactivada")
+
+        # Inicializar formateador legal si el dominio es "legal"
+        self.legal_optimizer = None
+        if domain == "legal" and LEGAL_FORMATTER_AVAILABLE:
+            try:
+                self.legal_optimizer = LegalTextOptimizer(style="plain")
+                logger.info("Formateador de documentos legales ACTIVADO (texto plano)")
+            except Exception as e:
+                logger.warning(f"Error inicializando formateador legal: {e}")
+        elif domain == "legal" and not LEGAL_FORMATTER_AVAILABLE:
+            logger.warning("Dominio 'legal' seleccionado pero formateador no disponible")
 
         # Patrones unificados de errores OCR (50+ patrones)
         self.ocr_patterns = [
@@ -141,9 +162,19 @@ class TextOptimizer:
         if not text:
             return text
 
+        # Si es dominio legal, usar formateador especializado
+        if self.domain == "legal" and self.legal_optimizer:
+            return self.legal_optimizer.optimize(text)
+
         # Aplicar correcciones básicas de espaciado/puntuación
         optimized = self._fix_spacing(text)
         optimized = self._fix_punctuation(optimized)
+
+        # Corregir hifenación de fin de línea (antes de otros patrones)
+        optimized = self._fix_hyphenation(optimized)
+
+        # Corregir comillas y paréntesis desemparejados
+        optimized = self._fix_unbalanced_pairs(optimized)
 
         # Aplicar patrones OCR con o sin validación lingüística
         if self.use_linguistic_validation and self.linguistic_corrector:
@@ -200,6 +231,56 @@ class TextOptimizer:
         text = re.sub(r'--+', '—', text)
         return text
 
+    def _fix_unbalanced_pairs(self, text):
+        """
+        Corrige comillas y paréntesis desemparejados.
+
+        Patrones corregidos:
+        - "texto' → "texto" (comilla doble + apóstrofe)
+        - 'texto" → "texto" (apóstrofe + comilla doble)
+        - (texto  → (texto) (paréntesis sin cerrar al fin de línea)
+        - texto)  → (texto) (paréntesis sin abrir al inicio)
+        """
+        # Comillas mezcladas: "texto' → "texto"
+        text = re.sub(r'"([^"\']+)\'', r'"\1"', text)
+
+        # Comillas mezcladas invertidas: 'texto" → "texto"
+        text = re.sub(r'\'([^"\']+)"', r'"\1"', text)
+
+        # Paréntesis sin cerrar al final de línea: (texto\n → (texto)\n
+        text = re.sub(r'\(([^()\n]+)\n', r'(\1)\n', text)
+
+        # Paréntesis sin abrir al inicio de línea: \ntexto) → \n(texto)
+        text = re.sub(r'\n([^()\n]+)\)', r'\n(\1)', text)
+
+        # Corchetes sin cerrar al final de línea: [texto\n → [texto]\n
+        text = re.sub(r'\[([^\[\]\n]+)\n', r'[\1]\n', text)
+
+        # Corchetes sin abrir al inicio de línea: \ntexto] → \n[texto]
+        text = re.sub(r'\n([^\[\]\n]+)\]', r'\n[\1]', text)
+
+        return text
+
+    def _fix_hyphenation(self, text):
+        """
+        Reúne palabras separadas por guión al final de línea.
+
+        Corrige hifenación de fin de línea típica de documentos con columnas:
+        - "docu-\\nmento" → "documento"
+        - "infor-\\nmación" → "información"
+
+        Excepciones: No une guiones legítimos (ej: "hijo-padre" en misma línea)
+        """
+        # Patrón: palabra terminada en guión + salto de línea + continuación minúscula
+        # El guión debe estar al final de línea (antes de \n o \r\n)
+        # La continuación debe comenzar con minúscula (indica que es parte de la misma palabra)
+        pattern = r'(\w+)-\s*[\r\n]+\s*([a-záéíóúüñ])'
+
+        # Reemplazar: unir las partes de la palabra
+        text = re.sub(pattern, r'\1\2', text)
+
+        return text
+
 
 class MarkdownOptimizer(TextOptimizer):
     """Optimizador específico para markdown con detección de tablas."""
@@ -220,6 +301,14 @@ class MarkdownOptimizer(TextOptimizer):
         self.detect_tables = detect_tables and TABLE_DETECTION_AVAILABLE
         self.table_detector = None
 
+        # En markdown, forzar formateador legal en estilo markdown
+        if domain == "legal" and LEGAL_FORMATTER_AVAILABLE:
+            try:
+                self.legal_optimizer = LegalTextOptimizer(style="markdown")
+                logger.info("Formateador de documentos legales ACTIVADO (markdown)")
+            except Exception as e:
+                logger.warning(f"Error inicializando formateador legal (markdown): {e}")
+
         if self.detect_tables:
             try:
                 self.table_detector = TableDetector(min_confidence=0.6)
@@ -235,19 +324,34 @@ class MarkdownOptimizer(TextOptimizer):
         if not markdown_text:
             return markdown_text
 
+        # 0. Proteger tablas HTML ya embebidas (<table>...</table>)
+        protected_html_tables = {}
+        if '<table' in markdown_text.lower():
+            def _html_table_replacer(match):
+                placeholder = f"<<<HTML_TABLE_{len(protected_html_tables)}>>>"
+                protected_html_tables[placeholder] = match.group(0)
+                return placeholder
+
+            text_to_optimize = re.sub(
+                r'(?is)<table\b.*?</table>',
+                _html_table_replacer,
+                markdown_text
+            )
+        else:
+            text_to_optimize = markdown_text
+
         # 1. Detectar y extraer tablas si está habilitado
         protected_tables = {}
-        text_to_optimize = markdown_text
 
         if self.detect_tables and self.table_detector:
             # Detectar tablas
-            tables = self.table_detector.detect_tables(markdown_text)
+            tables = self.table_detector.detect_tables(text_to_optimize)
 
             if tables:
                 logger.info(f"Detectadas {len(tables)} tablas para proteger")
 
                 # Reemplazar tablas con placeholders
-                lines = markdown_text.splitlines()
+                lines = text_to_optimize.splitlines()
                 for i, table in enumerate(tables):
                     placeholder = f"<<<TABLE_{i}>>>"
 
@@ -268,13 +372,56 @@ class MarkdownOptimizer(TextOptimizer):
 
                 text_to_optimize = "\n".join(lines)
 
-        # 2. Optimizar texto normal (sin tablas)
+        # 2. Structured legal formatting for full document
+        if self.domain == "legal" and self.legal_optimizer:
+            image_placeholders = {}
+
+            def _image_replacer(match):
+                placeholder = f"<<<IMG_{len(image_placeholders)}>>>"
+                image_placeholders[placeholder] = match.group(0)
+                return placeholder
+
+            text_to_optimize = re.sub(
+                r'!\[[^\]]*\]\([^\)]+\)',
+                _image_replacer,
+                text_to_optimize
+            )
+
+            optimized = self.legal_optimizer.optimize(text_to_optimize)
+
+            for placeholder, table_markdown in protected_tables.items():
+                optimized = re.sub(
+                    rf'^[ \t]*{re.escape(placeholder)}[ \t]*$',
+                    table_markdown,
+                    optimized,
+                    flags=re.MULTILINE
+                )
+
+            for placeholder, table_html in protected_html_tables.items():
+                optimized = re.sub(
+                    rf'^[ \t]*{re.escape(placeholder)}[ \t]*$',
+                    table_html,
+                    optimized,
+                    flags=re.MULTILINE
+                )
+
+            for placeholder, image_md in image_placeholders.items():
+                optimized = re.sub(
+                    rf'^[ \t]*{re.escape(placeholder)}[ \t]*$',
+                    image_md,
+                    optimized,
+                    flags=re.MULTILINE
+                )
+
+            return optimized
+
+        # 3. Optimizar texto normal (sin tablas)
         lines = text_to_optimize.split('\n')
         optimized_lines = []
 
         for line in lines:
             # Preservar placeholders de tablas
-            if line.strip().startswith('<<<TABLE_') and line.strip().endswith('>>>'):
+            if (line.strip().startswith('<<<TABLE_') or line.strip().startswith('<<<HTML_TABLE_')) and line.strip().endswith('>>>'):
                 optimized_lines.append(line)
             # Preservar líneas de imagen
             elif line.strip().startswith('!['):
@@ -294,9 +441,13 @@ class MarkdownOptimizer(TextOptimizer):
 
         optimized = '\n'.join(optimized_lines)
 
-        # 3. Restaurar tablas optimizadas
+        # 4. Restaurar tablas optimizadas
         for placeholder, table_markdown in protected_tables.items():
             optimized = optimized.replace(placeholder, table_markdown)
+
+        # 5. Restaurar tablas HTML embebidas
+        for placeholder, table_html in protected_html_tables.items():
+            optimized = optimized.replace(placeholder, table_html)
 
         return optimized
 

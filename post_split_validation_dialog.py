@@ -527,7 +527,8 @@ def test_post_split_dialog():
         recommended_total_files=6
     )
     
-    validator = PDFSplitValidator(max_size_mb=50.0)
+    from processing_limits import LIMITS
+    validator = PDFSplitValidator(max_size_mb=LIMITS.SAFE_MAX_SIZE_MB)
     
     # Test dialog
     root = ctk.CTk()

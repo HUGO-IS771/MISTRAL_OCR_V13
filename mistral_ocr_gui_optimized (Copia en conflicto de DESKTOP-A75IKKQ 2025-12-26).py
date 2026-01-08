@@ -9,8 +9,6 @@ Cambios: Eliminación de duplicidades y consolidación de métodos
 """
 
 import os
-import sys
-import time
 import threading
 import webbrowser
 import math
@@ -18,17 +16,13 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 import customtkinter as ctk
-from PIL import Image, ImageTk
 import logging
 from dotenv import load_dotenv
 import mimetypes
 import re
-from datetime import datetime
-import urllib.parse
-import subprocess
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass
-from functools import partial
+from collections import defaultdict
 
 # Importaciones opcionales
 try:
@@ -56,10 +50,10 @@ except ImportError:
             self.frame.pack(**kwargs)
 
 from mistral_ocr_client_optimized import MistralOCRClient
-from batch_optimizer import analyze_and_recommend, BatchOptimizer
-from multi_batch_processor import analyze_multiple_pdfs, MultiBatchProcessor
-from performance_optimizer import create_optimized_processor, estimate_batch_time
+from batch_optimizer import analyze_and_recommend
+from batch_processor import OCRBatchProcessor, create_optimized_processor, estimate_processing_time
 from split_control_dialog import show_advanced_split_dialog
+from processing_limits import LIMITS
 
 # Configuración
 load_dotenv(override=True)
@@ -72,11 +66,11 @@ logger = logging.getLogger('mistral_ocr_gui')
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-# Constantes
-MAX_FILE_SIZE_MB = 50.0
-MAX_PAGES_PER_FILE = 135
-DEFAULT_PAGES_PER_SPLIT = 70
-DEFAULT_WORKERS = 2
+# Constantes - Usar límites centralizados
+MAX_FILE_SIZE_MB = LIMITS.SAFE_MAX_SIZE_MB
+MAX_PAGES_PER_FILE = LIMITS.SAFE_MAX_PAGES
+DEFAULT_PAGES_PER_SPLIT = 70  # Calculado dinámicamente
+DEFAULT_WORKERS = LIMITS.DEFAULT_WORKERS
 SUPPORTED_FORMATS = [
     ("Todos los formatos", "*.pdf;*.jpg;*.jpeg;*.png;*.tiff;*.tif"),
     ("PDF", "*.pdf"),
@@ -98,8 +92,7 @@ class ProcessingConfig:
     optimize: bool = True
     optimization_domain: str = "legal"
     save_images: bool = True
-    enable_bbox_annotations: bool = False  # BBox annotations para descripciones automáticas de imágenes
-
+    
     def __post_init__(self):
         if self.output_formats is None:
             self.output_formats = ['md', 'txt', 'html', 'json']
@@ -189,180 +182,6 @@ class WidgetFactory:
         entry.bind("<FocusOut>", lambda e: var.set(default) if not var.get() else None)
         
         return entry
-
-
-class FileProcessor:
-    """Clase unificada para manejar el procesamiento de archivos"""
-    
-    def __init__(self, ocr_client: MistralOCRClient, app=None):
-        self.ocr_client = ocr_client
-        self.app = app
-        self.validation_result = None  # Para diálogo de validación
-        
-    def analyze_file(self, filepath: str) -> Dict[str, Any]:
-        """Analiza un archivo y retorna su información"""
-        try:
-            size_mb = self.ocr_client.get_file_size_mb(filepath)
-            pages_count = self.ocr_client.estimate_pages_count(filepath)
-            mime_type, _ = mimetypes.guess_type(filepath)
-            
-            # Determinar si requiere división:
-            # - Por páginas: si excede MAX_PAGES_PER_FILE
-            # - Por tamaño: si excede MAX_FILE_SIZE_MB (aunque no se puedan contar páginas)
-            requires_split = size_mb > MAX_FILE_SIZE_MB
-            if pages_count is not None:
-                requires_split = requires_split or pages_count > MAX_PAGES_PER_FILE
-            
-            return {
-                'path': filepath,
-                'size_mb': size_mb,
-                'pages': pages_count,
-                'mime_type': mime_type,
-                'requires_split': requires_split
-            }
-        except Exception as e:
-            logger.error(f"Error analyzing file {filepath}: {e}")
-            return None
-    
-    def process_with_split(self, file_info: Dict, config: ProcessingConfig) -> List[Dict]:
-        """Procesa un archivo con validación PRE-división para evitar crear archivos innecesarios"""
-        files_to_process = []
-        
-        if file_info['requires_split']:
-            # Determinar número de archivos objetivo
-            if hasattr(self, 'target_files_from_modal') and self.target_files_from_modal:
-                num_files_target = self.target_files_from_modal
-                logger.info(f"Usando configuración del modal: {num_files_target} archivos")
-            else:
-                # Calcular basado en páginas máximas o tamaño si no hay páginas
-                total_pages = file_info.get('pages')
-                size_mb = file_info.get('size_mb', 0)
-                
-                if total_pages is not None:
-                    # Calcular por páginas
-                    num_files_by_pages = math.ceil(total_pages / config.max_pages)
-                else:
-                    # Si no hay páginas, estimar por tamaño (asumiendo ~0.5MB por cada 10 páginas típicamente)
-                    num_files_by_pages = 1
-                
-                # Calcular también por tamaño
-                num_files_by_size = math.ceil(size_mb / config.max_size_mb)
-                
-                # Usar el mayor de ambos para garantizar que todos los archivos estén dentro de límites
-                num_files_target = max(num_files_by_pages, num_files_by_size, 1)
-                logger.info(f"División calculada: {num_files_target} archivos (por páginas: {num_files_by_pages}, por tamaño: {num_files_by_size})")
-            
-            # VALIDACIÓN PRE-DIVISIÓN: Estimar tamaños ANTES de crear archivos
-            try:
-                from pre_division_validator import PreDivisionValidator
-                from pre_division_dialog import show_pre_division_dialog
-                
-                pre_validator = PreDivisionValidator(max_size_mb=50.0)
-                file_path = Path(file_info['path'])
-                
-                # Validar si es seguro proceder con la división planeada
-                is_safe, analysis = pre_validator.validate_before_split(file_path, num_files_target)
-                
-                if not is_safe:
-                    # LOS ARCHIVOS ESTIMADOS EXCEDERÁN LÍMITES - MOSTRAR MODAL PREVENTIVO
-                    logger.warning(f"PRE-VALIDACIÓN: {analysis.files_exceeding_limits}/{num_files_target} archivos estimados excederán 50MB")
-                    
-                    # Mostrar modal de confirmación PRE-división
-                    if self.app:
-                        pre_result = None
-                        
-                        def show_pre_modal():
-                            nonlocal pre_result
-                            pre_result = show_pre_division_dialog(self.app, analysis, pre_validator)
-                        
-                        # Ejecutar modal en hilo principal
-                        self.app.after_idle(show_pre_modal)
-                        
-                        # Esperar resultado del modal
-                        while pre_result is None:
-                            self.app.update_idletasks()
-                            self.app.update()
-                            time.sleep(0.1)
-                        
-                        # Procesar decisión del usuario
-                        if pre_result.action == 'cancel':
-                            logger.info("Usuario canceló la división - no se crearán archivos")
-                            # No hay archivos que limpiar porque no se crearon
-                            return []
-                        elif pre_result.action == 'use_recommendation' or pre_result.action == 'adjust':
-                            # Actualizar número de archivos según decisión del usuario
-                            num_files_target = pre_result.num_files
-                            logger.info(f"Usuario eligió {num_files_target} archivos (pre-validado como seguro)")
-                        elif pre_result.action == 'proceed':
-                            logger.warning("Usuario eligió proceder creando archivos problemáticos (RIESGOSO)")
-                    else:
-                        logger.error("No hay app disponible para mostrar modal de pre-validación")
-                        return []
-                else:
-                    logger.info(f"PRE-VALIDACIÓN: División en {num_files_target} archivos es segura, procediendo...")
-                
-            except Exception as e:
-                logger.error(f"Error en pre-validación: {e}")
-                # Continuar con división normal como fallback
-            
-            # Limpiar configuración del modal después de usar
-            if hasattr(self, 'target_files_from_modal'):
-                self.target_files_from_modal = None
-            
-            # Ahora SÍ crear archivos físicos (ya pre-validados)
-            # Si no tenemos páginas, estimar basándose en tamaño (~4 páginas/MB típicamente)
-            total_pages = file_info.get('pages')
-            if total_pages is None:
-                size_mb = file_info.get('size_mb', 50)
-                total_pages = int(size_mb * 4)  # Estimación conservadora
-                logger.info(f"Páginas estimadas por tamaño: {total_pages} (basado en {size_mb:.1f}MB)")
-            pages_per_file = math.ceil(total_pages / num_files_target)
-            
-            split_info = self.ocr_client.split_pdf(
-                file_info['path'], 
-                max_pages_per_file=pages_per_file
-            )
-            
-            # Registrar archivos divididos para limpieza automática
-            try:
-                from file_cleanup_manager import register_split_files_for_cleanup
-                register_split_files_for_cleanup(split_info, Path(file_info['path']))
-            except Exception as e:
-                logger.warning(f"No se pudo registrar archivos para limpieza: {e}")
-            
-            # Archivos ya pre-validados - procesar directamente
-            logger.info("Archivos divididos creados después de pre-validación")
-            
-            # Calcular páginas por archivo dividido basado en archivos reales creados
-            total_pages = split_info['total_pages']
-            actual_files = split_info.get('files', [])
-            
-            # Distribución real de páginas
-            pages_remaining = total_pages
-            
-            for idx, split_file in enumerate(actual_files):
-                if idx == len(actual_files) - 1:
-                    # Último archivo recibe todas las páginas restantes
-                    pages_in_this_file = pages_remaining
-                else:
-                    # Distribución uniforme para otros archivos
-                    pages_in_this_file = pages_per_file
-                
-                files_to_process.append({
-                    'file_path': split_file,
-                    'original_file': file_info['path'],
-                    'pages': pages_in_this_file
-                })
-                
-                pages_remaining -= pages_in_this_file
-        else:
-            files_to_process.append({
-                'file_path': file_info['path'],
-                'original_file': file_info['path'],
-                'pages': file_info.get('pages', 0)
-            })
-        
-        return files_to_process
 
 
 class UIUpdater:
@@ -499,13 +318,7 @@ class MistralOCRApp(ctk.CTk):
         # Variables básicas
         self.api_key = tk.StringVar(value=os.environ.get("MISTRAL_API_KEY", ""))
         self.model = tk.StringVar(value="mistral-ocr-latest")
-        
-        # Variables de configuración simplificadas
-        self.config_vars = {
-            'optimization_domain': tk.StringVar(value="legal"),
-            'optimize_text': tk.BooleanVar(value=True)
-        }
-        
+
         # Variables para batch
         self.batch_vars = {
             'file_paths': [],
@@ -525,20 +338,18 @@ class MistralOCRApp(ctk.CTk):
             'optimize': {
                 'enabled': tk.BooleanVar(value=True),
                 'domain': tk.StringVar(value="legal")
-            },
-            'bbox_annotations': tk.BooleanVar(value=False),
+            }
         }
         
         # Variables de estado
         self.processing = False
         self.ocr_response = None
-        self.processing_results = None
         self.view_mode = tk.StringVar(value="Markdown")
         self.auto_optimize = tk.BooleanVar(value=True)
     
     def post_init(self):
         """Inicialización posterior a la creación de widgets"""
-        self.validate_all_numeric_inputs()
+        pass
     
     def create_widgets(self):
         """Crear la interfaz principal con pestañas"""
@@ -696,7 +507,7 @@ class MistralOCRApp(ctk.CTk):
         ).pack(side="left", padx=10)
     
     # --- Helper Methods ---
-
+    
     def create_section(self, parent, title: str) -> ctk.CTkFrame:
         """Crear una sección con título"""
         frame = ctk.CTkFrame(parent)
@@ -709,13 +520,9 @@ class MistralOCRApp(ctk.CTk):
         content_frame = ctk.CTkFrame(frame)
         content_frame.pack(fill="x", padx=10, pady=5)
         content_frame.grid_columnconfigure(1, weight=1)
-        
+
         return content_frame
-    
-    # Método eliminado - opciones integradas en procesamiento unificado
-    
-    # Método eliminado - opciones integradas en procesamiento unificado
-    
+
     def create_batch_file_section(self, parent):
         """Crear sección de selección de archivos para batch"""
         frame = self.create_section(parent, "Archivos PDF")
@@ -812,15 +619,6 @@ class MistralOCRApp(ctk.CTk):
             command=self.estimate_processing_time,
             width=120
         ).pack(side="right", padx=10)
-
-        bbox_frame = ctk.CTkFrame(frame)
-        bbox_frame.grid(row=3, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
-
-        ctk.CTkCheckBox(
-            bbox_frame,
-            text="Describir imagenes con BBox annotations",
-            variable=self.batch_vars['bbox_annotations']
-        ).pack(side="left", padx=10)
     
     def create_text_area(self, parent, title: str, height: int = 10) -> scrolledtext.ScrolledText:
         """Crear área de texto con título"""
@@ -849,23 +647,7 @@ class MistralOCRApp(ctk.CTk):
         ).pack(anchor="w", padx=10, pady=(0, 10))
     
     # --- File Operations ---
-    
-    # Método eliminado - ahora se usa select_batch_files
-    
-    def save_file_dialog(self, var: tk.StringVar, filetypes: list):
-        """Abrir diálogo para guardar archivo"""
-        initial_dir = ""
-        if self.file_path.get():
-            initial_dir = os.path.dirname(self.file_path.get())
-        
-        filepath = filedialog.asksaveasfilename(
-            title="Guardar archivo",
-            filetypes=filetypes + [("Todos", "*.*")],
-            initialdir=initial_dir
-        )
-        if filepath:
-            var.set(filepath)
-    
+
     def browse_directory(self, var: tk.StringVar):
         """Abrir diálogo para seleccionar directorio"""
         directory = filedialog.askdirectory(title="Seleccionar directorio")
@@ -913,7 +695,7 @@ class MistralOCRApp(ctk.CTk):
         elif len(files) > 1:
             # Multiple files - show multi-batch analysis
             try:
-                summary = analyze_multiple_pdfs(files)
+                summary = self.file_processor.analyze_multiple_files(files)
                 self.show_multi_batch_analysis(summary)
             except Exception as e:
                 logger.error(f"Error analyzing multiple files: {e}")
@@ -989,43 +771,22 @@ class MistralOCRApp(ctk.CTk):
         if 0 <= index < len(self.batch_vars['file_paths']):
             self.batch_vars['file_paths'].pop(index)
             self.update_files_display()
-    
-    # --- Event Handlers ---
-    
-    # Método eliminado - funcionalidad integrada en selección de archivos para procesamiento
-    
-    # Método eliminado - ahora se usa directorio de salida unificado
-    
+
     # --- Processing Methods ---
-    
+
     def init_ocr_client(self) -> bool:
         """Inicializar cliente OCR si es necesario"""
-        desired_bbox = False
-        if 'bbox_annotations' in self.batch_vars:
-            desired_bbox = self.batch_vars['bbox_annotations'].get()
-
-        if self.ocr_client and getattr(self.ocr_client, 'enable_bbox_annotations', False) != desired_bbox:
-            self.ocr_client = None
-
         if not self.ocr_client and self.api_key.get():
             try:
-                self.ocr_client = MistralOCRClient(
-                    api_key=self.api_key.get(),
-                    enable_bbox_annotations=desired_bbox
-                )
-                self.file_processor = FileProcessor(self.ocr_client, self)
+                self.ocr_client = MistralOCRClient(api_key=self.api_key.get())
+                # Usar procesador unificado de batch_processor.py (Fase 3)
+                self.file_processor = OCRBatchProcessor(self.ocr_client, app=self)
                 return True
             except Exception as e:
                 messagebox.showerror("Error", f"No se pudo inicializar el cliente: {str(e)}")
                 return False
         return bool(self.ocr_client)
-    
-    # Método eliminado - ahora todo usa start_processing()
-    
-    # Método eliminado - ahora se guarda desde el procesamiento unificado
-    
-    # Método eliminado - ahora se muestra desde el procesamiento unificado
-    
+
     def update_preview(self):
         """Actualizar vista previa del documento"""
         if self.ocr_response:
@@ -1066,95 +827,9 @@ class MistralOCRApp(ctk.CTk):
         self.process_btn.configure(state="normal", text="Iniciar procesamiento")
         self.progress_bar.set(0)
         self.processing = False
-    
-    # --- Compression and Split Methods ---
-    
-    def compress_file(self):
-        """Comprimir archivo PDF seleccionado"""
-        if not self.file_path.get():
-            messagebox.showerror("Error", "Seleccione un archivo PDF primero")
-            return
-        
-        mime_type, _ = mimetypes.guess_type(self.file_path.get())
-        if mime_type != 'application/pdf':
-            messagebox.showerror("Error", "Solo se pueden comprimir archivos PDF")
-            return
-        
-        if not self.init_ocr_client():
-            return
-        
-        self.ui_updater.update_status("Comprimiendo PDF...")
-        
-        thread = threading.Thread(target=self._compress_thread)
-        thread.daemon = True
-        thread.start()
-    
-    def _compress_thread(self):
-        """Thread para comprimir archivo"""
-        try:
-            quality = self.config_vars['compression_quality'].get()
-            compressed = self.ocr_client.compress_pdf(self.file_path.get(), quality=quality)
-            
-            # Update selected file
-            self.file_path.set(str(compressed))
-            self.on_file_selected(str(compressed))
-            
-            self.ui_updater.update_status("PDF comprimido guardado")
-            messagebox.showinfo("Éxito", "PDF comprimido exitosamente")
-            
-        except Exception as e:
-            logger.error(f"Error compressing: {str(e)}")
-            messagebox.showerror("Error", f"Error al comprimir: {str(e)}")
-            self.ui_updater.update_status("Error al comprimir")
-    
-    def split_file(self):
-        """Dividir archivo PDF seleccionado"""
-        if not self.file_path.get():
-            messagebox.showerror("Error", "Seleccione un archivo PDF primero")
-            return
-        
-        mime_type, _ = mimetypes.guess_type(self.file_path.get())
-        if mime_type != 'application/pdf':
-            messagebox.showerror("Error", "Solo se pueden dividir archivos PDF")
-            return
-        
-        if not self.init_ocr_client():
-            return
-        
-        self.ui_updater.update_status("Dividiendo PDF...")
-        
-        thread = threading.Thread(target=self._split_thread)
-        thread.daemon = True
-        thread.start()
-    
-    def _split_thread(self):
-        """Thread para dividir archivo"""
-        try:
-            max_pages = self.batch_vars['max_pages'].get()
-            split_info = self.ocr_client.split_pdf(
-                self.file_path.get(), max_pages_per_file=max_pages
-            )
-            
-            files_str = "\n".join([str(f) for f in split_info['files']])
-            messagebox.showinfo(
-                "División completada",
-                f"PDF dividido en {len(split_info['files'])} archivos:\n\n{files_str}"
-            )
-            
-            # Select first file
-            if split_info['files']:
-                self.file_path.set(str(split_info['files'][0]))
-                self.on_file_selected(str(split_info['files'][0]))
-            
-            self.ui_updater.update_status("PDF dividido exitosamente")
-            
-        except Exception as e:
-            logger.error(f"Error splitting: {str(e)}")
-            messagebox.showerror("Error", f"Error al dividir: {str(e)}")
-            self.ui_updater.update_status("Error al dividir")
-    
+
     # --- Batch Processing Methods ---
-    
+
     def start_processing(self):
         """Iniciar procesamiento por lotes"""
         # Validations
@@ -1199,7 +874,7 @@ class MistralOCRApp(ctk.CTk):
         try:
             if not self.init_ocr_client():
                 return
-
+            
             # Get configuration
             config = ProcessingConfig(
                 api_key=self.api_key.get(),
@@ -1208,10 +883,9 @@ class MistralOCRApp(ctk.CTk):
                 max_pages=self.batch_vars['max_pages'].get(),
                 output_formats=[k for k, v in self.batch_vars['formats'].items() if v.get()],
                 optimize=self.batch_vars['optimize']['enabled'].get(),
-                optimization_domain=self.batch_vars['optimize']['domain'].get(),
-                enable_bbox_annotations=self.batch_vars['bbox_annotations'].get()
+                optimization_domain=self.batch_vars['optimize']['domain'].get()
             )
-
+            
             input_files = self.batch_vars['file_paths']
             output_dir = self.batch_vars['output_dir'].get()
             
@@ -1377,7 +1051,7 @@ class MistralOCRApp(ctk.CTk):
             'save_txt': 'txt' in config.output_formats,
             'save_html': 'html' in config.output_formats,
             'save_images': 'images' in config.output_formats,
-            'save_json': 'json' in config.output_formats,
+            'save_json': 'json' in config.output_formats
         }
         
         # Process with optimizations
@@ -1386,26 +1060,20 @@ class MistralOCRApp(ctk.CTk):
         )
         
         # Convert format for compatibility
+        # ProcessingResult es un dataclass, no un dict
         converted_results = {'success': [], 'failed': []}
-        
+
         for item in results['success']:
-            if hasattr(item, 'file_path'):
-                converted_results['success'].append({
-                    'file': item.file_path,
-                    'original_file': getattr(item, 'original_file', item.file_path),
-                    'pages': getattr(item.metrics, 'pages_count', 0),
-                    'page_offset': getattr(item, 'page_offset', 0)
-                })
-            else:
-                converted_results['success'].append({
-                    'file': item['file'],
-                    'original_file': item.get('original_file', item['file']),
-                    'pages': item.get('metrics', type('', (), {'pages_count': 0})).pages_count,
-                    'page_offset': item.get('page_offset', 0)
-                })
-        
+            # item es un ProcessingResult dataclass
+            converted_results['success'].append({
+                'file': item.file_path,
+                'original_file': item.file_path,  # ProcessingResult no tiene original_file separado
+                'pages': item.metrics.pages_count if item.metrics else 0,
+                'page_offset': item.page_offset
+            })
+
         converted_results['failed'] = results['failed']
-        
+
         return converted_results
     
     def _process_traditional(self, files, config, output_dir):
@@ -1519,12 +1187,9 @@ class MistralOCRApp(ctk.CTk):
         
         # Group by original file if multiple
         if original_files > 1:
-            by_original = {}
+            by_original = defaultdict(list)
             for item in results['success']:
-                original = item['original_file']
-                if original not in by_original:
-                    by_original[original] = []
-                by_original[original].append(item)
+                by_original[item['original_file']].append(item)
             
             if by_original:
                 summary += f"\nDetalles por archivo original:\n"
@@ -1635,18 +1300,16 @@ class MistralOCRApp(ctk.CTk):
                 self.ui_updater.append_to_text(
                     self.results_text,
                     f"\n🤖 Ajuste automático aplicado: {result.adjusted_summary.new_file_count} archivos\n"
+                    f"⚠️ Nota: Reajuste manual necesario - funcionalidad pendiente de implementación\n"
                 )
-                # Reiniciar procesamiento con nuevos parámetros
-                self.continue_processing_after_validation(result.adjusted_summary, file_info, config)
-            
+
             elif result and result.action == 'proceed_anyway':
                 # Continuar con archivos problemáticos
                 self.ui_updater.append_to_text(
                     self.results_text,
                     f"\n⚠️ Usuario eligió proceder con archivos que exceden límites (RIESGOSO)\n"
+                    f"⚠️ Nota: Procesamiento directo - funcionalidad pendiente de implementación\n"
                 )
-                # Continuar procesamiento original
-                self.continue_processing_anyway(summary, file_info, config)
             
             else:
                 # Usuario canceló
@@ -1661,17 +1324,7 @@ class MistralOCRApp(ctk.CTk):
                 self.results_text,
                 f"\n❌ Error en validación: {str(e)}\n"
             )
-    
-    def continue_processing_after_validation(self, adjusted_summary, file_info, config):
-        """Continuar procesamiento después de validación exitosa"""
-        # Implementar lógica para continuar con archivos ajustados
-        pass
-    
-    def continue_processing_anyway(self, summary, file_info, config):
-        """Continuar procesamiento con archivos problemáticos"""
-        # Implementar lógica para continuar con archivos originales (riesgoso)
-        pass
-    
+
     def show_multi_batch_analysis(self, summary):
         """Muestra ventana con análisis de múltiples archivos"""
         # Create dialog window
@@ -1765,7 +1418,7 @@ Tiempo estimado: {summary.processing_time_estimate:.1f} minutos"""
                 })
             
             # Estimate time
-            estimated_seconds, time_description = estimate_batch_time(files_info)
+            estimated_seconds, time_description = estimate_processing_time(files_info)
             
             # Show estimation
             total_size = sum(info['size_mb'] for info in files_info)
@@ -1781,28 +1434,9 @@ Tiempo estimado: {summary.processing_time_estimate:.1f} minutos"""
         except Exception as e:
             logger.error(f"Error estimating time: {str(e)}")
             messagebox.showerror("Error", f"Error al estimar tiempo: {str(e)}")
-    
+
     # --- Utility Methods ---
-    
-    # Método eliminado - no necesario en procesamiento unificado
-    
-    def validate_all_numeric_inputs(self):
-        """Validar todas las entradas numéricas"""
-        validations = [
-            (self.batch_vars['max_pages'], DEFAULT_PAGES_PER_SPLIT),
-            (self.batch_vars['max_size'], MAX_FILE_SIZE_MB),
-            (self.batch_vars['max_pages'], MAX_PAGES_PER_FILE),
-            (self.batch_vars['workers'], DEFAULT_WORKERS)
-        ]
-        
-        for var, default in validations:
-            try:
-                value = var.get()
-                if not value or float(value) <= 0:
-                    var.set(default)
-            except (ValueError, tk.TclError):
-                var.set(default)
-    
+
     def show_placeholder(self, text: str):
         """Mostrar placeholder en área de previsualización"""
         for widget in self.preview_container.winfo_children():

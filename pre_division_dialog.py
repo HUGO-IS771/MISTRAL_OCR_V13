@@ -541,7 +541,8 @@ def test_pre_division_dialog():
         test_file = Path(tmp.name)
     
     try:
-        validator = PreDivisionValidator(max_size_mb=50.0)
+        from processing_limits import LIMITS
+        validator = PreDivisionValidator(max_size_mb=LIMITS.SAFE_MAX_SIZE_MB)
         analysis = validator.analyze_division_plan(test_file, 5)  # 5 archivos problemáticos
         
         # Test dialog

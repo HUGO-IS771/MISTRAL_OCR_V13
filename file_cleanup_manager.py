@@ -23,7 +23,7 @@ import atexit
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('file_cleanup_manager')
 
-@dataclass
+@dataclass(frozen=True)
 class TemporaryFileInfo:
     """Información de archivo temporal"""
     file_path: Path

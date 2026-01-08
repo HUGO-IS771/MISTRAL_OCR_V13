@@ -62,7 +62,12 @@ echo ✅ Procesamiento batch avanzado
 echo.
 echo Iniciando...
 echo.
-python mistral_ocr_gui_optimized.py
+if exist .venv\Scripts\python.exe (
+    .venv\Scripts\python.exe mistral_ocr_gui_optimized.py
+) else (
+    echo ⚠️ No se detecto el entorno virtual .venv. Usando Python por defecto...
+    python mistral_ocr_gui_optimized.py
+)
 if %errorlevel% neq 0 (
     echo.
     echo ❌ Error al ejecutar la aplicacion desktop.

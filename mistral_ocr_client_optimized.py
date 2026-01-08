@@ -9,22 +9,23 @@ Versión: 4.0.0 (Optimizada)
 """
 
 import os
-import sys
 import time
-import subprocess
 import logging
 import base64
 import re
 import mimetypes
 from pathlib import Path
-from typing import List, Dict, Union, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple
 import concurrent.futures
 from dotenv import load_dotenv
 from mistralai import Mistral
 from text_md_optimization import TextOptimizer, MarkdownOptimizer
 from image_preprocessor import ImagePreprocessor
 from ocr_quality_metrics import QualityScorer
+from processing_limits import LIMITS
 import datauri
+import json
+import html as html_lib
 
 # Configuración
 load_dotenv(override=True)
@@ -46,6 +47,80 @@ MIME_TYPES = {
 
 for ext, mime in MIME_TYPES.items():
     mimetypes.add_type(mime, ext)
+
+
+def _resolve_table_injections(page_content: str, page, use_tokens: bool = False) -> Tuple[str, Dict[str, str]]:
+    """
+    Resuelve la inyección de tablas manejando índices globales y protección de contenido.
+
+    Args:
+        page_content: Markdown original
+        page: Objeto Page de Mistral OCR
+        use_tokens: Si True, reemplaza con tokens seguros (para optimización posterior)
+                    Si False, reemplaza directamente con HTML
+
+    Returns:
+        Tuple[str, Dict]: (contenido_modificado, mapa_de_tokens_a_html)
+    """
+    token_map = {}
+    
+    # Verificar si hay tablas
+    if not hasattr(page, 'tables') or not page.tables:
+        return page_content, token_map
+
+    # 1. Encontrar todos los placeholders reales en el texto (ej: tbl-5.html, tbl-12.html)
+    # Mistral usa índices globales, no reinician por página.
+    # Regex busca patrones 'tbl-NUM.html'
+    found_placeholders = sorted(list(set(re.findall(r'tbl-\d+\.html', page_content))), 
+                              key=lambda x: int(re.search(r'\d+', x).group()))
+
+    tables = page.tables
+    
+    # Validación básica
+    if not found_placeholders:
+        return page_content, token_map
+        
+    if len(found_placeholders) != len(tables):
+        logger.warning(f"Desajuste de tablas: Encontrados {len(found_placeholders)} placeholders para {len(tables)} tablas.")
+    
+    # 2. Mapear placeholders encontrados a tablas disponibles (en orden)
+    for i, (placeholder, table_obj) in enumerate(zip(found_placeholders, tables)):
+        # Extraer contenido HTML del objeto tabla
+        if hasattr(table_obj, 'content') and isinstance(table_obj.content, str):
+            table_html = table_obj.content
+        else:
+            table_html = str(table_obj)
+
+        # Preparar el contenido a inyectar (Token o HTML final)
+        if use_tokens:
+            replacement = f"__OCR_TABLE_TOKEN_{i}__"
+            # Guardar el mapeo del token al HTML final (envuelto)
+            wrapped_table = f'\\n\\n<div class="ocr-table">\\n{table_html}\\n</div>\\n\\n'
+            token_map[replacement] = wrapped_table
+        else:
+            replacement = f'\\n\\n<div class="ocr-table">\\n{table_html}\\n</div>\\n\\n'
+
+        # 3. Realizar reemplazos en el texto
+        # Patrones posibles en el markdown
+        patterns = [
+            f'[{placeholder}]({placeholder})',  # [tbl-1.html](tbl-1.html)
+            f'<a href="{placeholder}">{placeholder}</a>', # HTML anchor
+            f'[{placeholder}]',
+            placeholder # Fallback directo
+        ]
+        
+        replaced = False
+        for pattern in patterns:
+            if pattern in page_content:
+                page_content = page_content.replace(pattern, replacement)
+                replaced = True
+        
+        if not replaced:
+             # Intento final con regex para variantes
+             clean_ph = re.escape(placeholder)
+             page_content = re.sub(rf'\[{clean_ph}\]\({clean_ph}\)', replacement, page_content)
+
+    return page_content, token_map
 
 
 class ImageProcessor:
@@ -110,13 +185,14 @@ class ImageProcessor:
 class MistralOCRClient:
     """Cliente optimizado para Mistral OCR."""
     
-    def __init__(self, api_key=None, enable_preprocessing=True):
+    def __init__(self, api_key=None, enable_preprocessing=True, enable_bbox_annotations=False):
         """
         Inicializa el cliente.
 
         Args:
             api_key: API key de Mistral (opcional, puede usar variable de entorno)
             enable_preprocessing: Si True, preprocesa imágenes para mejorar OCR
+            enable_bbox_annotations: Si True, activa descripciones automáticas de imágenes con BBox Annotations
         """
         self.api_key = api_key or os.environ.get("MISTRAL_API_KEY")
         if not self.api_key:
@@ -125,6 +201,7 @@ class MistralOCRClient:
         self.client = Mistral(api_key=self.api_key)
         self.image_processor = ImageProcessor()
         self.enable_preprocessing = enable_preprocessing
+        self.enable_bbox_annotations = enable_bbox_annotations
 
         # Inicializar preprocesador de imágenes
         if enable_preprocessing:
@@ -133,6 +210,21 @@ class MistralOCRClient:
         else:
             self.preprocessor = None
             logger.info("Preprocesamiento de imágenes desactivado")
+
+        # Inicializar BBox annotations si está habilitado
+        self.bbox_format = None
+        if enable_bbox_annotations:
+            try:
+                from bbox_annotations import create_bbox_annotation_format
+                self.bbox_format = create_bbox_annotation_format()
+                logger.info("✓ BBox Annotations ACTIVADO (descripciones automáticas de imágenes)")
+            except ImportError:
+                logger.warning("bbox_annotations.py no encontrado. BBox annotations desactivado.")
+                self.enable_bbox_annotations = False
+            except Exception as e:
+                logger.warning(f"Error inicializando BBox annotations: {e}. Desactivado.")
+                self.enable_bbox_annotations = False
+
         logger.info("Cliente Mistral OCR inicializado")
     
     # === Métodos principales ===
@@ -145,10 +237,13 @@ class MistralOCRClient:
             "document_url": url
         }, model, include_images)
     
-    def process_local_file(self, file_path: str, model="mistral-ocr-latest", 
-                          include_images=True, max_size_mb=50):
+    def process_local_file(self, file_path: str, model="mistral-ocr-latest",
+                          include_images=True, max_size_mb=None):
         """Procesa archivo local."""
         file_path = Path(file_path)
+        # Usar límite centralizado si no se especifica
+        if max_size_mb is None:
+            max_size_mb = LIMITS.DEFAULT_MAX_SIZE_MB
         self._validate_file(file_path, max_size_mb)
         
         logger.info(f"Procesando archivo: {file_path}")
@@ -190,22 +285,17 @@ class MistralOCRClient:
         logger.info(f"Markdown guardado: {output_path}")
         return output_path
     
-    def save_text(self, ocr_response, output_path=None, page_offset=0, 
+    def save_text(self, ocr_response, output_path=None, page_offset=0,
                   optimize=False, domain="general"):
         """Guarda solo texto extraído."""
         output_path = self._prepare_output_path(output_path, "txt")
-        optimizer = TextOptimizer(domain) if optimize else None
-        
+
+        # Usar get_text() para generar contenido
+        text_content = self.get_text(ocr_response, page_offset, optimize, domain)
+
         with open(output_path, "wt", encoding="utf-8") as f:
-            for i, page in enumerate(ocr_response.pages):
-                page_num = i + 1 + page_offset
-                f.write(f"=== PÁGINA {page_num} ===\n\n")
-                
-                text = self._extract_plain_text(page.markdown)
-                if optimizer:
-                    text = optimizer.optimize_text(text)
-                f.write(text + "\n\n")
-        
+            f.write(text_content)
+
         logger.info(f"Texto guardado: {output_path}")
         return output_path
     
@@ -250,19 +340,19 @@ class MistralOCRClient:
             Path: Ruta del archivo HTML generado
         """
         output_path = self._prepare_output_path(output_path, "html")
-        
+
         # Generar contenido HTML directamente (no usar markdown para imágenes)
         html_body = self._generate_html_content_with_images(
             ocr_response, page_offset, optimize, domain
         )
-        
+
         # Generar HTML completo con estilos premium
         html_content = self._generate_premium_html(
-            html_body, title, theme, 
+            html_body, title, theme,
             total_pages=len(ocr_response.pages),
             total_images=sum(len(p.images) for p in ocr_response.pages)
         )
-        
+
         # Guardar archivo
         with open(output_path, "wt", encoding="utf-8") as f:
             f.write(html_content)
@@ -270,687 +360,140 @@ class MistralOCRClient:
         logger.info(f"HTML guardado: {output_path}")
         return output_path
     
+    def save_json(self, ocr_response, output_path=None):
+        """
+        Guarda la respuesta completa de la API en formato JSON.
+        Útil para depuración y para conservar toda la estructura de Mistral OCR 3.
+        """
+        output_path = self._prepare_output_path(output_path, "json")
+        
+        # Convertir objeto de respuesta a diccionario serializable
+        try:
+            # Si el objeto tiene un método model_dump o dict (Pydantic v2/v1)
+            if hasattr(ocr_response, 'model_dump'):
+                data = ocr_response.model_dump()
+            elif hasattr(ocr_response, 'dict'):
+                data = ocr_response.dict()
+            else:
+                # Fallback manual si no es un objeto Pydantic
+                data = json.loads(json.dumps(ocr_response, default=lambda o: getattr(o, '__dict__', str(o))))
+        except Exception as e:
+            logger.error(f"Error serializando respuesta OCR a JSON: {e}")
+            # Intentar fallback más agresivo si falla
+            data = str(ocr_response)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            
+        logger.info(f"JSON guardado: {output_path}")
+        return output_path
+    
     def _generate_html_content_with_images(self, ocr_response, page_offset: int,
                                            optimize: bool, domain: str) -> str:
         """
         Genera contenido markdown con imágenes incrustadas como data URIs.
         El markdown será procesado por marked.js en el navegador.
+
+        IMPORTANTE: Escapa referencias jurisprudenciales que usan <> para evitar
+        que marked.js las interprete como tags HTML.
         """
-        from text_md_optimization import MarkdownOptimizer
-        
-        optimizer = MarkdownOptimizer(domain) if optimize else None
-        markdown_parts = []
-        
-        for i, page in enumerate(ocr_response.pages):
-            page_num = i + 1 + page_offset
-            markdown_parts.append(f'\n\n---\n\n## 📄 Página {page_num}\n\n')
-            
-            # Obtener markdown de la página
-            page_content = page.markdown
-            
-            # Optimizar si se solicita
-            if optimizer:
-                page_content = optimizer.optimize_markdown(page_content)
-            
-            # Crear diccionario de imágenes con sus data URIs
-            image_data_map = {}
-            for img in page.images:
-                img_data, extension = self.image_processor.extract_image_data(img)
-                if img_data and hasattr(img, 'id'):
-                    # Crear data URI completo
-                    mime_type = f"image/{extension}" if extension != 'jpg' else "image/jpeg"
-                    data_uri = f"data:{mime_type};base64,{base64.b64encode(img_data).decode()}"
-                    image_data_map[img.id] = data_uri
-            
-            # Reemplazar referencias de imágenes con data URIs
-            for img_id, data_uri in image_data_map.items():
-                # Reemplazar ![id](id) con ![id](data:...)
-                page_content = page_content.replace(
-                    f"![{img_id}]({img_id})",
-                    f"![{img_id}]({data_uri})"
-                )
-            
-            markdown_parts.append(page_content)
-        
-        # Unir todo el contenido markdown
-        full_markdown = '\n'.join(markdown_parts)
-        
-        # Escapar caracteres especiales para JavaScript
-        escaped_markdown = (full_markdown
-            .replace('\\', '\\\\')
-            .replace('`', '\\`')
-            .replace('$', '\\$')
-            .replace('</script>', '<\\/script>')
+        markdown = self._process_pages_to_markdown(
+            ocr_response, page_offset, optimize, domain,
+            page_header_fn=lambda num: f"\n\n---\n\n## 📄 Página {num}\n\n",
+            image_processor_fn=lambda p, c: self._enrich_page_images(p, c, correct_mime=True),
+            include_headers_footers=False,
+            separator=""
         )
-        
+
+        # Escapar referencias jurisprudenciales que causan problemas con marked.js
+        # Estas referencias usan <> y marked.js las interpreta como HTML tags
+        markdown = self._escape_legal_references(markdown)
+
+        return markdown
+
+    def _escape_legal_references(self, markdown: str) -> str:
+        """
+        Escapa referencias jurisprudenciales que usan <> para evitar que marked.js
+        las interprete como tags HTML malformados.
+
+        Las referencias jurisprudenciales mexicanas usan formato como:
+        - <1a.j. 35/2019 (10a.)>
+        - <P.J. 11/2018 (10a.)>
+        - <2a./J. 123/2014 (10a.)>
+
+        También maneja casos ALTAMENTE corruptos de Mistral API como:
+        - <p.j. 32="" 99,="" p.j.="" 1="" 97="">
+        - <p.j. (10a.)="" 21="" 2014="" 2015="" 99="" a="" aplicación="" ...>
+
+        Estrategia: Escapar TODOS los tags que contengan indicadores de referencias
+        jurisprudenciales, sin importar cuán corruptos estén.
+
+        Args:
+            markdown: Texto markdown con posibles referencias jurisprudenciales
+
+        Returns:
+            Markdown con referencias escapadas usando entidades HTML
+        """
+        import re
+
+        def escape_match(match):
+            """Reemplaza < y > por entidades HTML en la referencia."""
+            reference = match.group(0)
+            return reference.replace('<', '&lt;').replace('>', '&gt;')
+
+        # ESTRATEGIA AGRESIVA: Capturar TODO lo que parezca una referencia legal
+        # incluso si está extremadamente corrupto
+
+        # Lista de todos los patrones a escapar
+        patterns = [
+            # 1. Referencias normales con números y letras
+            # <1a.j. 35/2019 (10a.)>, <1a. CCCXXVII/2014 (10a.)>
+            r'<\d+[aA]\.(?:/)?[jJ]?\.?\s*[^>]+?>',
+
+            # 2. Referencias que empiezan con P (P.J., p.j.)
+            # <P.J. 11/2018 (10a.)>, <p.j. ...>
+            r'<[PAp]\.?[jJ]?\.?\s*[^>]+?>',
+
+            # 3. Referencias de registro
+            # <Reg. 239099>, <reg. 123456>
+            r'<[Rr]eg\.\s*[^>]+?>',
+
+            # 4. Tags con atributos HTML corruptos (contienen ="" o ="")
+            # <p.j. 32="" 99,="" ...>, <1a. (10a.)="" 21="" ...>
+            r'<[^>]*?=""[^>]*?>',
+
+            # 5. Tags que contienen el patrón (10a.) o (9a.) o similar
+            # Esto captura referencias corruptas que contienen épocas
+            r'<[^>]*?\(\d+a\.\)[^>]*?>',
+
+            # 6. Tags que contienen números romanos (referencias a artículos)
+            # <I/2019>, <CCCXXVII/2014>
+            r'<[IVXLCDM]+/\d{4}[^>]*?>',
+
+            # 7. Tags que contienen patrones como "2a./J."
+            r'<\d+[aA]\./[JjPp][^>]*?>',
+        ]
+
+        escaped_markdown = markdown
+        for pattern in patterns:
+            escaped_markdown = re.sub(pattern, escape_match, escaped_markdown)
+
         return escaped_markdown
-    
+
     def _generate_premium_html(self, body_content: str, title: str, theme: str,
                                total_pages: int, total_images: int) -> str:
         """Genera HTML completo con estilos premium."""
-        
-        # Colores según tema
-        if theme == "dark":
-            bg_color = "#1a1a2e"
-            text_color = "#eaeaea"
-            card_bg = "#16213e"
-            accent_color = "#0f3460"
-            border_color = "#0f3460"
-            header_bg = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
-            table_header_bg = "#0f3460"
-            table_alt_bg = "#1a1a2e"
-            link_color = "#64b5f6"
-            code_bg = "#0d1117"
-        else:
-            bg_color = "#f8fafc"
-            text_color = "#1e293b"
-            card_bg = "#ffffff"
-            accent_color = "#3b82f6"
-            border_color = "#e2e8f0"
-            header_bg = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
-            table_header_bg = "#f1f5f9"
-            table_alt_bg = "#f8fafc"
-            link_color = "#2563eb"
-            code_bg = "#f1f5f9"
-        
-        html_template = f'''<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="generator" content="Mistral OCR Client v4.0">
-    <meta name="description" content="Documento procesado con Mistral OCR - {total_pages} páginas">
-    <title>{title}</title>
-    
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    
-    <style>
-        /* === Reset & Base === */
-        *, *::before, *::after {{
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }}
-        
-        html {{
-            scroll-behavior: smooth;
-        }}
-        
-        body {{
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background-color: {bg_color};
-            color: {text_color};
-            line-height: 1.7;
-            font-size: 16px;
-            min-height: 100vh;
-        }}
-        
-        /* === Header Premium === */
-        .header {{
-            background: {header_bg};
-            color: white;
-            padding: 2.5rem 2rem;
-            text-align: center;
-            position: relative;
-            overflow: hidden;
-        }}
-        
-        .header::before {{
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Cpath d='m36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
-            opacity: 0.5;
-        }}
-        
-        .header h1 {{
-            font-size: 2.25rem;
-            font-weight: 700;
-            margin-bottom: 0.75rem;
-            position: relative;
-            text-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        
-        .header-meta {{
-            display: flex;
-            justify-content: center;
-            gap: 2rem;
-            font-size: 0.9rem;
-            opacity: 0.9;
-            position: relative;
-        }}
-        
-        .header-meta span {{
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }}
-        
-        /* === Main Content === */
-        .container {{
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 2rem;
-        }}
-        
-        .content {{
-            background: {card_bg};
-            border-radius: 16px;
-            padding: 3rem;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 
-                        0 2px 4px -1px rgba(0, 0, 0, 0.06);
-            border: 1px solid {border_color};
-        }}
-        
-        /* === Typography === */
-        h1, h2, h3, h4, h5, h6 {{
-            font-weight: 600;
-            margin-top: 2rem;
-            margin-bottom: 1rem;
-            color: {text_color};
-        }}
-        
-        h1 {{ font-size: 2rem; border-bottom: 3px solid {accent_color}; padding-bottom: 0.5rem; }}
-        h2 {{ font-size: 1.5rem; border-bottom: 2px solid {border_color}; padding-bottom: 0.4rem; }}
-        h3 {{ font-size: 1.25rem; }}
-        h4 {{ font-size: 1.1rem; }}
-        
-        p {{
-            margin-bottom: 1.25rem;
-            text-align: justify;
-            hyphens: auto;
-        }}
-        
-        a {{
-            color: {link_color};
-            text-decoration: none;
-            border-bottom: 1px solid transparent;
-            transition: border-color 0.2s ease;
-        }}
-        
-        a:hover {{
-            border-bottom-color: {link_color};
-        }}
-        
-        /* === Images === */
-        img {{
-            max-width: 100%;
-            height: auto;
-            border-radius: 12px;
-            margin: 1.5rem auto;
-            display: block;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.15);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }}
-        
-        img:hover {{
-            transform: scale(1.02);
-            box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.2);
-        }}
-        
-        /* === OCR Images with Figures === */
-        .ocr-image {{
-            margin: 2rem 0;
-            text-align: center;
-            background: {table_alt_bg};
-            padding: 1.5rem;
-            border-radius: 16px;
-            border: 1px solid {border_color};
-        }}
-        
-        .ocr-image img {{
-            max-width: 100%;
-            height: auto;
-            margin: 0 auto 1rem auto;
-            border-radius: 8px;
-            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
-        }}
-        
-        .ocr-image figcaption {{
-            font-size: 0.85rem;
-            color: {text_color}99;
-            font-style: italic;
-            margin-top: 0.75rem;
-        }}
-        
-        /* === Page Headers === */
-        .page-header {{
-            background: linear-gradient(90deg, {accent_color}20, transparent);
-            padding: 0.75rem 1.5rem;
-            border-left: 4px solid {accent_color};
-            margin: 2.5rem 0 1.5rem 0;
-            border-radius: 0 8px 8px 0;
-        }}
-        
-        /* === Page Separators === */
-        .page-separator {{
-            border: none;
-            height: 3px;
-            background: linear-gradient(90deg, transparent, {accent_color}50, transparent);
-            margin: 3rem 0;
-        }}
-        
-        /* === Tables Premium === */
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin: 2rem 0;
-            font-size: 0.95rem;
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
-        }}
-        
-        thead {{
-            background: {table_header_bg};
-        }}
-        
-        th {{
-            padding: 1rem 1.25rem;
-            text-align: left;
-            font-weight: 600;
-            text-transform: uppercase;
-            font-size: 0.8rem;
-            letter-spacing: 0.05em;
-            border-bottom: 2px solid {accent_color};
-        }}
-        
-        td {{
-            padding: 1rem 1.25rem;
-            border-bottom: 1px solid {border_color};
-            vertical-align: top;
-        }}
-        
-        tbody tr {{
-            transition: background-color 0.15s ease;
-        }}
-        
-        tbody tr:nth-child(even) {{
-            background-color: {table_alt_bg};
-        }}
-        
-        tbody tr:hover {{
-            background-color: {accent_color}15;
-        }}
-        
-        /* === Code Blocks === */
-        code {{
-            font-family: 'JetBrains Mono', 'Fira Code', monospace;
-            background: {code_bg};
-            padding: 0.2rem 0.5rem;
-            border-radius: 6px;
-            font-size: 0.9em;
-        }}
-        
-        pre {{
-            background: {code_bg};
-            padding: 1.5rem;
-            border-radius: 12px;
-            overflow-x: auto;
-            margin: 1.5rem 0;
-            border: 1px solid {border_color};
-        }}
-        
-        pre code {{
-            background: none;
-            padding: 0;
-        }}
-        
-        /* === Lists === */
-        ul, ol {{
-            margin: 1rem 0 1.5rem 2rem;
-        }}
-        
-        li {{
-            margin-bottom: 0.5rem;
-        }}
-        
-        /* === Blockquotes === */
-        blockquote {{
-            border-left: 4px solid {accent_color};
-            margin: 1.5rem 0;
-            padding: 1rem 1.5rem;
-            background: {accent_color}10;
-            border-radius: 0 12px 12px 0;
-            font-style: italic;
-        }}
-        
-        /* === Page Separator === */
-        hr {{
-            border: none;
-            height: 2px;
-            background: linear-gradient(90deg, transparent, {accent_color}, transparent);
-            margin: 3rem 0;
-        }}
-        
-        hr.page-separator {{
-            height: 3px;
-            margin: 4rem 0;
-            background: linear-gradient(90deg, transparent 5%, {accent_color}40 50%, transparent 95%);
-        }}
-        
-        /* === GFM Tables (from marked.js) === */
-        .gfm-table {{
-            width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-            margin: 2rem 0;
-            font-size: 0.95rem;
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
-            border: 1px solid {border_color};
-        }}
-        
-        .gfm-table thead {{
-            background: linear-gradient(135deg, {accent_color}15, {accent_color}05);
-        }}
-        
-        .gfm-table th {{
-            padding: 1rem 1.25rem;
-            text-align: left;
-            font-weight: 600;
-            font-size: 0.85rem;
-            letter-spacing: 0.03em;
-            border-bottom: 2px solid {accent_color};
-            color: {text_color};
-        }}
-        
-        .gfm-table td {{
-            padding: 0.875rem 1.25rem;
-            border-bottom: 1px solid {border_color};
-            vertical-align: top;
-        }}
-        
-        .gfm-table tbody tr {{
-            transition: background-color 0.15s ease;
-        }}
-        
-        .gfm-table tbody tr:nth-child(even) {{
-            background-color: {table_alt_bg};
-        }}
-        
-        .gfm-table tbody tr:hover {{
-            background-color: {accent_color}08;
-        }}
-        
-        .gfm-table tbody tr:last-child td {{
-            border-bottom: none;
-        }}
-        
-        /* Responsive table wrapper */
-        .table-wrapper {{
-            overflow-x: auto;
-            margin: 2rem 0;
-            border-radius: 12px;
-        }}
-        
-        /* === Footer === */
-        .footer {{
-            text-align: center;
-            padding: 2rem;
-            color: {text_color}80;
-            font-size: 0.85rem;
-        }}
-        
-        .footer a {{
-            color: {accent_color};
-        }}
-        
-        /* === Print Styles === */
-        @media print {{
-            .header {{
-                background: #667eea !important;
-                -webkit-print-color-adjust: exact;
-                print-color-adjust: exact;
-            }}
-            
-            .content {{
-                box-shadow: none;
-                border: 1px solid #ddd;
-            }}
-            
-            img {{
-                max-width: 80%;
-                page-break-inside: avoid;
-            }}
-            
-            h1, h2, h3 {{
-                page-break-after: avoid;
-            }}
-            
-            table {{
-                page-break-inside: avoid;
-            }}
-        }}
-        
-        /* === Responsive === */
-        @media (max-width: 768px) {{
-            .container {{
-                padding: 1rem;
-            }}
-            
-            .content {{
-                padding: 1.5rem;
-                border-radius: 12px;
-            }}
-            
-            .header {{
-                padding: 1.5rem 1rem;
-            }}
-            
-            .header h1 {{
-                font-size: 1.5rem;
-            }}
-            
-            .header-meta {{
-                flex-direction: column;
-                gap: 0.5rem;
-            }}
-            
-            table {{
-                font-size: 0.85rem;
-            }}
-            
-            th, td {{
-                padding: 0.75rem;
-            }}
-        }}
-        
-        /* === Animations === */
-        @keyframes fadeIn {{
-            from {{ opacity: 0; transform: translateY(20px); }}
-            to {{ opacity: 1; transform: translateY(0); }}
-        }}
-        
-        .content {{
-            animation: fadeIn 0.5s ease-out;
-        }}
-        
-        /* === Loading State === */
-        .loading {{
-            text-align: center;
-            padding: 3rem;
-            color: {text_color}80;
-        }}
-        
-        .loading::after {{
-            content: '';
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 2px solid {accent_color};
-            border-radius: 50%;
-            border-top-color: transparent;
-            animation: spin 1s linear infinite;
-            margin-left: 10px;
-            vertical-align: middle;
-        }}
-        
-        @keyframes spin {{
-            to {{ transform: rotate(360deg); }}
-        }}
-    </style>
-</head>
-<body>
-    <header class="header">
-        <h1>📄 {title}</h1>
-        <div class="header-meta">
-            <span>📑 {total_pages} página{"s" if total_pages != 1 else ""}</span>
-            <span>🖼️ {total_images} imagen{"es" if total_images != 1 else ""}</span>
-            <span>⚡ Procesado con Mistral OCR</span>
-        </div>
-    </header>
-    
-    <main class="container">
-        <article class="content" id="markdown-content">
-            <div class="loading">Renderizando documento...</div>
-        </article>
-    </main>
-    
-    <footer class="footer">
-        <p>Generado con <strong>Mistral OCR Client v4.0</strong> • 
-        <a href="https://docs.mistral.ai/" target="_blank">Documentación Mistral AI</a></p>
-    </footer>
-    
-    <!-- Marked.js desde CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    
-    <script>
-        // Contenido Markdown con imágenes incrustadas
-        const markdownContent = `{body_content}`;
-        
-        // Configurar marked para GFM (GitHub Flavored Markdown)
-        marked.setOptions({{
-            gfm: true,           // GitHub Flavored Markdown
-            breaks: true,        // Saltos de línea como <br>
-            headerIds: true,     // IDs en encabezados
-            mangle: false,       // No codificar emails
-            pedantic: false,
-            smartLists: true,
-            smartypants: true    // Tipografía inteligente
-        }});
-        
-        // Renderizar el markdown
-        document.addEventListener('DOMContentLoaded', function() {{
-            const container = document.getElementById('markdown-content');
-            
-            try {{
-                container.innerHTML = marked.parse(markdownContent);
-                
-                // Post-procesamiento: añadir clases a elementos
-                
-                // Estilizar tablas
-                container.querySelectorAll('table').forEach(table => {{
-                    table.classList.add('gfm-table');
-                }});
-                
-                // Estilizar imágenes
-                container.querySelectorAll('img').forEach(img => {{
-                    img.loading = 'lazy';
-                    img.style.cursor = 'zoom-in';
-                    
-                    // Lightbox al hacer clic
-                    img.addEventListener('click', function() {{
-                        const overlay = document.createElement('div');
-                        overlay.style.cssText = `
-                            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-                            background: rgba(0,0,0,0.9); display: flex;
-                            justify-content: center; align-items: center;
-                            z-index: 9999; cursor: zoom-out;
-                        `;
-                        const enlargedImg = this.cloneNode();
-                        enlargedImg.style.cssText = `
-                            max-width: 95%; max-height: 95%; object-fit: contain;
-                            border-radius: 8px; box-shadow: 0 0 50px rgba(0,0,0,0.5);
-                        `;
-                        overlay.appendChild(enlargedImg);
-                        overlay.addEventListener('click', () => overlay.remove());
-                        document.body.appendChild(overlay);
-                    }});
-                }});
-                
-                // Estilizar separadores horizontales
-                container.querySelectorAll('hr').forEach(hr => {{
-                    hr.classList.add('page-separator');
-                }});
-                
-            }} catch (error) {{
-                container.innerHTML = '<p style="color: red;">Error al renderizar el documento: ' + error.message + '</p>';
-                console.error('Error renderizando markdown:', error);
-            }}
-        }});
-    </script>
-</body>
-</html>'''
-        
-        return html_template
-    
-    # === Procesamiento por lotes optimizado ===
-    
-    def process_batch(self, file_paths: List[str], model="mistral-ocr-latest",
-                     include_images=True, max_workers=2, progress_callback=None):
-        """Procesa múltiples archivos."""
-        valid_files = self._validate_batch_files(file_paths)
-        if not valid_files:
-            return self._empty_batch_results()
-        
-        results = {'success': [], 'failed': []}
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
-            
-            # Enviar tareas con delay
-            for i, file_path in enumerate(valid_files):
-                if i > 0:
-                    time.sleep(3)  # Rate limiting
-                
-                future = executor.submit(
-                    self._process_single_file, file_path, model, include_images
-                )
-                futures[future] = file_path
-                
-                if progress_callback:
-                    progress_callback(file_path, i)
-            
-            # Recoger resultados
-            for future in concurrent.futures.as_completed(futures):
-                file_path = futures[future]
-                try:
-                    result = future.result()
-                    results['success'].append(result)
-                except Exception as e:
-                    results['failed'].append({'file': file_path, 'error': str(e)})
-        
-        return self._finalize_batch_results(results, file_paths)
-    
-    def batch_save_outputs(self, batch_results: Dict, output_formats: List[str], 
-                          output_dir=None):
-        """Guarda resultados de batch en formatos especificados."""
-        if not batch_results.get('success'):
-            return {}
-        
-        output_dir = Path(output_dir) if output_dir else Path.cwd()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        all_outputs = {}
-        page_offset = 0
-        
-        for result in sorted(batch_results['success'], key=lambda x: str(x['file'])):
-            file_outputs = self._save_file_outputs(
-                result, output_formats, output_dir, page_offset
-            )
-            all_outputs[str(result['file'])] = file_outputs
-            page_offset += len(result['response'].pages)
-        
-        return all_outputs
-    
+
+        from html_templates import render_premium_html
+
+        return render_premium_html(
+            body_content=body_content,
+            title=title,
+            theme=theme,
+            total_pages=total_pages,
+            total_images=total_images
+        )
+
     # === Utilidades para archivos PDF ===
     
     def split_pdf(self, file_path: str, max_pages_per_file=50, output_dir=None):
@@ -991,8 +534,10 @@ class MistralOCRClient:
     
     def compress_pdf(self, file_path: str, quality="medium", output_dir=None):
         """Comprime PDF usando Ghostscript."""
+        import sys
+        import subprocess
         from shutil import which
-        
+
         gs_cmd = "gswin64c" if sys.platform == "win32" else "gs"
         if not which(gs_cmd):
             raise RuntimeError("Se requiere Ghostscript")
@@ -1025,20 +570,111 @@ class MistralOCRClient:
         return output_path
     
     # === Métodos auxiliares privados ===
-    
+
+    def _process_pages_to_markdown(self, ocr_response, page_offset: int,
+                                   optimize: bool, domain: str,
+                                   page_header_fn=None,
+                                   image_processor_fn=None,
+                                   include_headers_footers: bool = True,
+                                   separator: str = "\n\n") -> str:
+        """
+        Método base unificado para procesar páginas OCR a markdown.
+
+        Args:
+            ocr_response: Respuesta OCR de Mistral
+            page_offset: Offset para numeración de páginas
+            optimize: Aplicar optimización de markdown
+            domain: Dominio de optimización
+            page_header_fn: Función para generar header de página (recibe page_num)
+            image_processor_fn: Función para procesar imágenes (recibe page, content)
+            include_headers_footers: Incluir headers/footers de Mistral OCR 3
+            separator: Separador entre páginas
+
+        Returns:
+            str: Contenido markdown generado
+        """
+        optimizer = MarkdownOptimizer(domain) if optimize else None
+        content_parts = []
+
+        for i, page in enumerate(ocr_response.pages):
+            page_num = i + 1 + page_offset
+
+            # Header de página (customizable)
+            if page_header_fn:
+                content_parts.append(page_header_fn(page_num))
+
+            # Encabezado de documento (Mistral OCR 3)
+            if include_headers_footers and hasattr(page, 'header') and page.header:
+                content_parts.append(f"**Encabezado:** {page.header}\n\n")
+
+            # Obtener contenido markdown
+            page_content = page.markdown
+
+            # CRÍTICO: Procesar tablas HTML (reemplazar placeholders tbl-X.html)
+            # PROTECCIÓN: Si se va a optimizar, usamos tokens para proteger el HTML
+            use_tokens = bool(optimizer)
+            page_content, token_map = _resolve_table_injections(page_content, page, use_tokens=use_tokens)
+
+            # Procesar imágenes (customizable)
+            if image_processor_fn:
+                page_content = image_processor_fn(page, page_content)
+
+            # Optimizar markdown (si aplica)
+            if optimizer:
+                page_content = optimizer.optimize_markdown(page_content)
+                
+                # RESTAURAR tablas protegidas (reemplazar tokens con HTML real)
+                if token_map:
+                    for token, html_content in token_map.items():
+                        page_content = page_content.replace(token, html_content)
+                    logger.debug(f"Página {page_num}: {len(token_map)} tablas restauradas post-optimización")
+
+            content_parts.append(page_content)
+
+            # Pie de página de documento (Mistral OCR 3)
+            if include_headers_footers and hasattr(page, 'footer') and page.footer:
+                content_parts.append(f"\n\n**Pie de página:** {page.footer}")
+
+            # Separador entre páginas
+            if i < len(ocr_response.pages) - 1:
+                content_parts.append(separator)
+
+        return "".join(content_parts)
+
     def _process_document(self, document: Dict, model: str, include_images: bool):
-        """Procesa documento con la API."""
+        """
+        Procesa documento con la API.
+
+        Si enable_bbox_annotations está activo, agrega bbox_annotation_format
+        para obtener descripciones automáticas de imágenes.
+        """
         start_time = time.time()
-        
-        response = self.client.ocr.process(
-            document=document,
-            model=model,
-            include_image_base64=include_images
-        )
-        
+
+        # Construir parámetros de la llamada
+        process_params = {
+            "document": document,
+            "model": model,
+            "include_image_base64": include_images
+            # NOTA: Parámetros no soportados en versión actual de Mistral API:
+            # "table_format": "html"
+            # "extract_header": True
+            # "extract_footer": True
+        }
+
+        # Agregar BBox annotations si esta habilitado
+        if self.enable_bbox_annotations and self.bbox_format:
+            if not include_images:
+                include_images = True
+                process_params["include_image_base64"] = True
+                logger.info("BBox annotations requiere include_image_base64=True. Forzando activacion.")
+            process_params["bbox_annotation_format"] = self.bbox_format
+            logger.info("BBox annotations activado - extrayendo descripciones de imagenes")
+
+        response = self.client.ocr.process(**process_params)
+
         elapsed = time.time() - start_time
         logger.info(f"Procesado en {elapsed:.2f}s - {len(response.pages)} páginas")
-        
+
         return response
     
     def _upload_file(self, file_path: Path) -> str:
@@ -1074,17 +710,9 @@ class MistralOCRClient:
             purpose="ocr"
         )
 
-        # Limpiar archivo temporal si se creó
-        if preprocessed_path and preprocessed_path != file_path:
-            try:
-                # No eliminar inmediatamente, puede necesitarse para retry
-                # Se limpiará automáticamente al final del proceso
-                pass
-            except:
-                pass
-
-        # Aumentar tiempo de expiración y añadir retry
+        # Obtener URL firmada con retry
         max_retries = 3
+        signed_url = None
         for attempt in range(max_retries):
             try:
                 signed_url = self.client.files.get_signed_url(
@@ -1093,12 +721,46 @@ class MistralOCRClient:
                 break
             except Exception as e:
                 if attempt == max_retries - 1:
+                    # Limpiar archivo preprocesado antes de lanzar excepción
+                    if preprocessed_path and preprocessed_path != file_path:
+                        self._cleanup_preprocessed_file(preprocessed_path)
                     raise
                 logger.warning(f"Error obteniendo URL firmada (intento {attempt + 1}): {e}")
                 time.sleep(2 ** attempt)  # Backoff exponencial
 
+        # Limpiar archivo preprocesado inmediatamente después de subida exitosa
+        if preprocessed_path and preprocessed_path != file_path:
+            self._cleanup_preprocessed_file(preprocessed_path)
+
         return signed_url.url
-    
+
+    def _cleanup_preprocessed_file(self, preprocessed_path: Path):
+        """
+        Limpia archivo preprocesado temporal de forma segura.
+
+        Args:
+            preprocessed_path: Ruta del archivo preprocesado a eliminar
+        """
+        try:
+            if preprocessed_path.exists():
+                preprocessed_path.unlink()
+                logger.debug(f"Archivo preprocesado eliminado: {preprocessed_path.name}")
+
+                # Intentar limpiar directorio si está vacío
+                temp_dir = preprocessed_path.parent
+                if temp_dir.name == '.temp_preprocessed':
+                    try:
+                        # Solo eliminar si está vacío
+                        if not any(temp_dir.iterdir()):
+                            temp_dir.rmdir()
+                            logger.debug(f"Directorio temporal eliminado: {temp_dir}")
+                    except (OSError, PermissionError):
+                        # Directorio no vacío o sin permisos, no es crítico
+                        pass
+        except Exception as e:
+            # No es crítico si falla la limpieza, solo advertir
+            logger.warning(f"No se pudo eliminar archivo preprocesado {preprocessed_path.name}: {e}")
+
     def _validate_file(self, file_path: Path, max_size_mb: float):
         """Valida archivo antes de procesar."""
         if not file_path.exists():
@@ -1127,31 +789,22 @@ class MistralOCRClient:
     def _generate_markdown_content(self, ocr_response, page_offset: int,
                                   enrich_images: bool, optimize: bool, domain: str) -> str:
         """Genera contenido markdown según opciones."""
-        optimizer = MarkdownOptimizer(domain) if optimize else None
-        content_parts = []
-        
-        for i, page in enumerate(ocr_response.pages):
-            page_num = i + 1 + page_offset
-            content_parts.append(f"# Página {page_num}\n\n")
-            
-            page_content = page.markdown
-            
-            # Enriquecer imágenes si se solicita
-            if enrich_images:
-                page_content = self._enrich_page_images(page, page_content)
-            
-            # Optimizar si se solicita
-            if optimizer:
-                page_content = optimizer.optimize_markdown(page_content)
-            
-            content_parts.append(page_content + "\n\n")
-        
-        return "\n".join(content_parts)
+        return self._process_pages_to_markdown(
+            ocr_response, page_offset, optimize, domain,
+            page_header_fn=lambda num: f"# Página {num}\n\n",
+            image_processor_fn=lambda p, c: self._enrich_page_images(p, c, correct_mime=True) if enrich_images else c,
+            include_headers_footers=True,
+            separator="\n\n"
+        )
     
     def _extract_plain_text(self, markdown: str) -> str:
         """Extrae texto plano de markdown."""
         lines = []
         for line in markdown.splitlines():
+            # Decodificar entidades HTML y limpiar tags
+            line = html_lib.unescape(line)
+            line = re.sub(r"</?[a-zA-Z][^>]*>", "", line)
+            line = re.sub(r"<([^<>]{1,200})>", r"\1", line)
             # Omitir imágenes
             if line.strip().startswith('!['):
                 continue
@@ -1165,31 +818,157 @@ class MistralOCRClient:
                 lines.append(line)
         
         return '\n'.join(lines)
-    
-    def _enrich_page_images(self, page, markdown_content: str) -> str:
-        """Enriquece markdown con imágenes base64."""
+
+    def _enrich_page_images(self, page, markdown_content: str,
+                           correct_mime: bool = True) -> str:
+        """
+        Enriquece markdown con imágenes base64 incrustadas.
+
+        Si BBox annotations está habilitado, también agrega descripciones
+        automáticas debajo de cada imagen.
+
+        Args:
+            page: Página OCR con imágenes
+            markdown_content: Contenido markdown a enriquecer
+            correct_mime: Si True, usa MIME type correcto (jpg/png/tiff).
+                         Si False, usa 'image/png' genérico (compatibilidad legacy)
+
+        Returns:
+            str: Markdown con imágenes incrustadas como data URIs y descripciones
+        """
+        image_data_map = {}
+        image_annotations = {}  # {img_id: annotation_text}
+
         for img in page.images:
-            img_data, _ = self.image_processor.extract_image_data(img)
-            if img_data and hasattr(img, 'id'):
-                data_uri = f"data:image/png;base64,{base64.b64encode(img_data).decode()}"
-                markdown_content = markdown_content.replace(
-                    f"![{img.id}]({img.id})",
-                    f"![{img.id}]({data_uri})"
-                )
+            img_id = getattr(img, 'id', None) or getattr(img, 'image_id', None)
+            img_data, extension = self.image_processor.extract_image_data(img)
+            if img_data and img_id:
+                # Determinar MIME type
+                if correct_mime:
+                    mime_type = f"image/{extension}" if extension != 'jpg' else "image/jpeg"
+                else:
+                    mime_type = "image/png"  # Legacy: siempre PNG
+
+                # Crear data URI
+                data_uri = f"data:{mime_type};base64,{base64.b64encode(img_data).decode()}"
+                image_data_map[img_id] = data_uri
+
+            # Extraer anotacion BBox si existe
+            if self.enable_bbox_annotations and img_id:
+                annotation = self._extract_bbox_annotation_from_image(img)
+                if annotation:
+                    # Formatear descripcion para markdown
+                    from bbox_annotations import format_image_description
+                    desc = format_image_description(annotation, format_type='markdown')
+                    if desc:
+                        image_annotations[img_id] = desc
+
+        # Reemplazar todas las referencias con data URIs y agregar descripciones
+        for img_id, data_uri in image_data_map.items():
+            old_ref = f"![{img_id}]({img_id})"
+            new_ref = f"![{img_id}]({data_uri})"
+
+            if img_id in image_annotations:
+                new_ref += f"\n\n{image_annotations[img_id]}"
+
+            if old_ref in markdown_content:
+                markdown_content = markdown_content.replace(old_ref, new_ref)
+            else:
+                pattern = rf"!\[{re.escape(img_id)}\]\(([^)]+)\)"
+                markdown_content = re.sub(pattern, new_ref, markdown_content)
+
+        for img_id, desc in image_annotations.items():
+            if img_id in image_data_map:
+                continue
+            pattern = rf"!\[{re.escape(img_id)}\]\(([^)]+)\)"
+            replacement = f"![{img_id}](\\1)\n\n{desc}"
+            markdown_content = re.sub(pattern, replacement, markdown_content)
+
         return markdown_content
-    
+
+    def _extract_bbox_annotation_from_image(self, img) -> Optional[Dict[str, str]]:
+        """
+        Extrae la anotación BBox de una imagen si existe.
+
+        Args:
+            img: Objeto de imagen de Mistral OCR
+
+        Returns:
+            Dict con 'image_type', 'short_description', 'summary' o None si no hay anotación
+        """
+        try:
+            # Posibles ubicaciones de la anotacion segun SDK de Mistral
+            annotation_data = None
+            for attr in ('annotation', 'bbox_annotation', 'structured_annotation', 'annotations', 'bbox_annotations'):
+                if hasattr(img, attr):
+                    annotation_data = getattr(img, attr)
+                    if annotation_data:
+                        break
+
+            if isinstance(annotation_data, (list, tuple)):
+                selected = None
+                for item in annotation_data:
+                    if not item:
+                        continue
+                    if isinstance(item, dict) and item.get('short_description'):
+                        selected = item
+                        break
+                    if hasattr(item, 'short_description') and getattr(item, 'short_description'):
+                        selected = item
+                        break
+                if selected is None and annotation_data:
+                    selected = annotation_data[0]
+                annotation_data = selected
+
+            if not annotation_data:
+                return None
+
+            # Convertir a diccionario estándar
+            ann_dict = {}
+
+            if isinstance(annotation_data, dict):
+                ann_dict = annotation_data
+            elif hasattr(annotation_data, 'model_dump'):
+                # Pydantic v2
+                ann_dict = annotation_data.model_dump()
+            elif hasattr(annotation_data, 'dict'):
+                # Pydantic v1
+                ann_dict = annotation_data.dict()
+            else:
+                # Intentar extraer atributos directamente
+                if hasattr(annotation_data, 'image_type'):
+                    ann_dict['image_type'] = annotation_data.image_type
+                if hasattr(annotation_data, 'short_description'):
+                    ann_dict['short_description'] = annotation_data.short_description
+                if hasattr(annotation_data, 'summary'):
+                    ann_dict['summary'] = annotation_data.summary
+
+            # Validar que tenga al menos short_description
+            if ann_dict.get('short_description'):
+                return {
+                    'image_type': ann_dict.get('image_type', 'image'),
+                    'short_description': ann_dict.get('short_description', ''),
+                    'summary': ann_dict.get('summary', '')
+                }
+
+        except Exception as e:
+            logger.debug(f"Error extrayendo bbox annotation: {e}")
+
+        return None
+
     def _validate_batch_files(self, file_paths: List[str]) -> List[Path]:
         """Valida archivos para procesamiento batch."""
         valid_files = []
-        
+
         for file_path in file_paths:
             path = Path(file_path)
             try:
-                self._validate_file(path, 50)  # Límite estándar
+                # Usar límite centralizado de batch
+                self._validate_file(path, LIMITS.BATCH_MAX_SIZE_MB)
                 valid_files.append(path)
             except Exception as e:
                 logger.warning(f"Archivo inválido {path}: {e}")
-        
+
         return valid_files
     
     def _process_single_file(self, file_path: Path, model: str, include_images: bool):
@@ -1230,6 +1009,10 @@ class MistralOCRClient:
                 response, path, page_offset, 
                 title=base_name.replace('_', ' ').title()
             )
+        
+        if 'json' in formats:
+            path = output_dir / f"{base_name}.json"
+            outputs['json'] = self.save_json(response, path)
         
         return outputs
     
@@ -1340,12 +1123,44 @@ class MistralOCRClient:
             logger.warning(f"No se pudo contar páginas de {Path(file_path).name}: {e}")
         return None
     
-    def get_text(self, ocr_response) -> str:
-        """Extrae todo el texto de la respuesta."""
+    def get_text(self, ocr_response, page_offset: int = 0, optimize: bool = False,
+                 domain: str = "general") -> str:
+        """
+        Extrae todo el texto de la respuesta.
+
+        Args:
+            ocr_response: Respuesta OCR de Mistral
+            page_offset: Offset para numeración de páginas (default: 0)
+            optimize: Aplicar optimización de texto (default: False)
+            domain: Dominio de optimización (default: "general")
+
+        Returns:
+            str: Texto completo formateado
+        """
+        optimizer = TextOptimizer(domain) if optimize else None
         texts = []
+
         for i, page in enumerate(ocr_response.pages):
-            texts.append(f"=== PÁGINA {i+1} ===\n")
-            texts.append(self._extract_plain_text(page.markdown))
+            page_num = i + 1 + page_offset
+            texts.append(f"=== PÁGINA {page_num} ===\n\n")
+
+            text = self._extract_plain_text(page.markdown)
+            if optimizer:
+                text = optimizer.optimize_text(text)
+
+            texts.append(text)
+            if self.enable_bbox_annotations and hasattr(page, 'images') and page.images:
+                descriptions = []
+                for img in page.images:
+                    annotation = self._extract_bbox_annotation_from_image(img)
+                    if annotation:
+                        from bbox_annotations import format_image_description
+                        desc = format_image_description(annotation, format_type='text')
+                        if desc:
+                            descriptions.append(desc)
+                if descriptions:
+                    texts.append("\n")
+                    texts.append("\n".join(descriptions))
             texts.append("\n\n")
         return "".join(texts)
     
@@ -1354,3 +1169,52 @@ class MistralOCRClient:
         return self._generate_markdown_content(
             ocr_response, 0, enrich_images=True, optimize=False, domain="general"
         )
+
+    @staticmethod
+    def cleanup_old_preprocessed_dirs(base_dir: Path = None, max_age_hours: int = 24) -> int:
+        """
+        Limpia directorios .temp_preprocessed más antiguos que max_age_hours.
+
+        Esta es una función de mantenimiento que puede ejecutarse periódicamente
+        para limpiar directorios temporales abandonados por errores o cancelaciones.
+
+        Args:
+            base_dir: Directorio base donde buscar (default: directorio actual)
+            max_age_hours: Edad máxima en horas (default: 24 horas)
+
+        Returns:
+            int: Número de directorios eliminados
+        """
+        import shutil
+
+        if base_dir is None:
+            base_dir = Path.cwd()
+
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        cleaned_count = 0
+
+        try:
+            # Buscar recursivamente directorios .temp_preprocessed
+            for temp_dir in base_dir.rglob('.temp_preprocessed'):
+                if not temp_dir.is_dir():
+                    continue
+
+                try:
+                    # Verificar edad del directorio
+                    dir_age_seconds = current_time - temp_dir.stat().st_mtime
+                    if dir_age_seconds > max_age_seconds:
+                        # Eliminar directorio y todo su contenido
+                        shutil.rmtree(temp_dir)
+                        logger.info(f"Directorio temporal antiguo eliminado: {temp_dir} (edad: {dir_age_seconds/3600:.1f}h)")
+                        cleaned_count += 1
+                except Exception as e:
+                    logger.warning(f"Error eliminando directorio temporal {temp_dir}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error durante limpieza de directorios temporales: {e}")
+
+        if cleaned_count > 0:
+            logger.info(f"Limpieza completada: {cleaned_count} directorios temporales eliminados")
+
+        return cleaned_count
