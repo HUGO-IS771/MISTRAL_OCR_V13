@@ -527,10 +527,24 @@ class MistralOCRClient:
 
     # === Utilidades para archivos PDF ===
     
-    def split_pdf(self, file_path: str, max_pages_per_file=50, output_dir=None):
-        """Divide PDF en archivos más pequeños."""
+    def split_pdf(self, file_path: str, max_pages_per_file=None, max_size_mb=None, output_dir=None):
+        """
+        Divide PDF usando 'Adaptive Chunking' para optimizar rendimiento.
+        
+        Estrategia:
+        - Divide por páginas.
+        - Verifica tamaño SOLO cuando se estima necesario (heurística).
+        - Minimiza serializaciones costosas en memoria.
+        
+        Args:
+            file_path: Ruta al archivo PDF.
+            max_pages_per_file: Límite de páginas.
+            max_size_mb: Límite de tamaño en MB.
+            output_dir: Directorio de salida.
+        """
         try:
             from PyPDF2 import PdfReader, PdfWriter
+            import io
         except ImportError:
             raise ImportError("Se requiere PyPDF2: pip install PyPDF2")
         
@@ -538,24 +552,132 @@ class MistralOCRClient:
         output_dir = Path(output_dir or file_path.parent)
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Establecer límites seguros si no se proveen
+        if max_pages_per_file is None:
+            max_pages_per_file = LIMITS.safe_max_pages
+        if max_size_mb is None:
+            max_size_mb = LIMITS.safe_max_size_mb
+            
+        logger.info(f"Dividiendo PDF (Adaptativo): {file_path.name}")
+        logger.info(f"  Límites: {max_pages_per_file} págs / {max_size_mb:.1f} MB")
+        
         pdf = PdfReader(file_path)
         total_pages = len(pdf.pages)
         
-        output_files = []
-        for i in range(0, total_pages, max_pages_per_file):
-            writer = PdfWriter()
-            end_page = min(i + max_pages_per_file, total_pages)
+        # Calcular tamaño total y promedio por página
+        try:
+            total_size_mb = file_path.stat().st_size / (1024 * 1024)
+        except:
+            total_size_mb = 10.0 # Fallback
             
-            for j in range(i, end_page):
-                writer.add_page(pdf.pages[j])
-            
-            output_file = output_dir / f"{file_path.stem}_pag{i+1}-{end_page}.pdf"
-            with open(output_file, "wb") as f:
-                writer.write(f)
-            
-            output_files.append(output_file)
+        # Heurística inicial
+        avg_mb_per_page = total_size_mb / total_pages if total_pages > 0 else 0.1
+        # logger.info(f"  Tamaño total: {total_size_mb:.2f} MB, Promedio/pág: {avg_mb_per_page:.4f} MB")
         
-        logger.info(f"PDF dividido en {len(output_files)} archivos")
+        output_files = []
+        current_writer = PdfWriter()
+        current_pages = 0
+        current_start_idx = 0
+        
+        # Umbral de seguridad para empezar a chequear (85% del límite para ser conservador)
+        check_threshold_mb = max_size_mb * 0.85
+        
+        for i, page in enumerate(pdf.pages):
+            current_writer.add_page(page)
+            current_pages += 1
+            
+            should_check_size = False
+            should_split = False
+            reason = ""
+            
+            # 1. Chequeo por páginas (Hard limit)
+            if current_pages >= max_pages_per_file:
+                should_split = True
+                reason = "max_pages"
+            
+            # 2. Chequeo por heurística de tamaño (Soft check trigger)
+            # Estimamos tamaño actual. Si supera el umbral, verificamos tamaño REAL.
+            else:
+                estimated_size = current_pages * avg_mb_per_page
+                
+                # Chequear si:
+                # a) Estimación supera umbral
+                # b) Cada 50 páginas (por si acaso hay imágenes grandes)
+                # c) Si el promedio es muy alto (>1MB/pag), chequear más seguido
+                
+                if estimated_size > check_threshold_mb:
+                    should_check_size = True
+                elif current_pages % 50 == 0 and current_pages > 0:
+                    should_check_size = True
+                elif avg_mb_per_page > 1.0 and current_pages % 10 == 0:
+                    should_check_size = True
+
+            if should_check_size and not should_split:
+                # Serialización (Costoso - Solo hacer si necesario)
+                mem = io.BytesIO()
+                current_writer.write(mem)
+                real_size_mb = mem.tell() / (1024 * 1024)
+                
+                if real_size_mb > max_size_mb:
+                    # Excedido! Backtracking necesario.
+                    should_split = True
+                    reason = "max_size"
+                    
+                    # Manejo de archivo único gigante
+                    if current_pages == 1:
+                        logger.warning(f"  ⚠️ Pág {i+1} sola excede límite ({real_size_mb:.2f} MB). Enviando igual.")
+                        # No hay nada que hacer, se enviará así.
+                        # El split ocurrirá al final del loop o forzado aquí?
+                        # Si forzamos split aquí, guardamos 1 página y reseteamos.
+                        # Pero el código de abajo guarda current_writer.
+                        pass 
+                    else:
+                        # Backtracking: El archivo válido es SIN la última página.
+                        logger.info(f"  Límite alcanzado en pág {i+1} ({real_size_mb:.1f} MB). Dividiendo...")
+                        
+                        # Recreamos el writer válido
+                        valid_writer = PdfWriter()
+                        # Copiamos desde start hasta i-1
+                        for p_idx in range(current_start_idx, i):
+                            valid_writer.add_page(pdf.pages[p_idx])
+                            
+                        # Guardar el chunk válido
+                        output_filename = f"{file_path.stem}_part{len(output_files)+1}_p{current_start_idx+1}-{i}.pdf"
+                        output_path = output_dir / output_filename
+                        with open(output_path, "wb") as f:
+                            valid_writer.write(f)
+                        output_files.append(output_path)
+                        
+                        # Resetear con la página actual (i) como inicio del nuevo chunk
+                        current_writer = PdfWriter()
+                        current_writer.add_page(page)
+                        current_pages = 1
+                        current_start_idx = i
+                        continue # Saltamos el guardado estándar al final del loop
+            
+            # Si se decidió dividir por páginas (sin overflow de tamaño)
+            if should_split and reason == "max_pages":
+                output_filename = f"{file_path.stem}_part{len(output_files)+1}_p{current_start_idx+1}-{i+1}.pdf"
+                output_path = output_dir / output_filename
+                
+                with open(output_path, "wb") as f:
+                    current_writer.write(f)
+                output_files.append(output_path)
+                
+                # Reset
+                current_writer = PdfWriter()
+                current_pages = 0
+                current_start_idx = i + 1
+
+        # Guardar el último chunk si tiene páginas
+        if current_pages > 0:
+            output_filename = f"{file_path.stem}_part{len(output_files)+1}_p{current_start_idx+1}-{total_pages}.pdf"
+            output_path = output_dir / output_filename
+            with open(output_path, "wb") as f:
+                current_writer.write(f)
+            output_files.append(output_path)
+        
+        logger.info(f"PDF dividido exitosamente en {len(output_files)} archivos")
         return {
             'files': output_files,
             'total_files': len(output_files),

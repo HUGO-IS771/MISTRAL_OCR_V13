@@ -348,9 +348,13 @@ class OCRBatchProcessor:
 
             pages_per_file = math.ceil(total_pages / num_files_target)
 
+            # Obtener límite de tamaño configurado o default
+            max_size_mb = getattr(config, 'max_size_mb', self.MAX_SIZE_MB)
+
             split_info = self.ocr_client.split_pdf(
                 file_info['path'],
-                max_pages_per_file=pages_per_file
+                max_pages_per_file=pages_per_file,
+                max_size_mb=max_size_mb
             )
 
             # Registrar para limpieza

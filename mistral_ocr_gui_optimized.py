@@ -342,7 +342,7 @@ class MistralOCRApp(ctk.CTk):
                 'enabled': tk.BooleanVar(value=True),
                 'domain': tk.StringVar(value="legal")
             },
-            'table_format': tk.StringVar(value="html"),
+            'table_format': tk.StringVar(value="markdown"),
             'extract_header': tk.BooleanVar(value=False),
             'extract_footer': tk.BooleanVar(value=False)
         }
@@ -1087,9 +1087,11 @@ class MistralOCRApp(ctk.CTk):
             'table_format': None if config.table_format == "none" else config.table_format,
             'extract_header': config.extract_header,
             'extract_footer': config.extract_footer,
-            # CRITICAL FIX: Pass optimization parameters
+            # CRITICAL FIX: Pass optimization parameters and LIMITS
             'optimize': config.optimize,
-            'optimization_domain': config.optimization_domain
+            'optimization_domain': config.optimization_domain,
+            'max_size_mb': config.max_size_mb,
+            'max_pages': config.max_pages
         }
         
         # Process with optimizations
