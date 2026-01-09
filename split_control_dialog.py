@@ -19,6 +19,7 @@ import math
 from pathlib import Path
 from batch_optimizer import SplitRecommendation, PDFAnalysis
 from pdf_split_validator import PDFSplitValidator, ValidationSummary
+from processing_limits import LIMITS
 
 @dataclass
 class InteractiveSplitResult:
@@ -58,6 +59,7 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
         
         # Variables para controlar callbacks durante inicialización
         self._initializing = True
+        self._updating = False
         
         # Variables calculadas
         self.estimated_mb_per_file = tk.DoubleVar()
@@ -481,56 +483,118 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
     
     def _on_files_slider_changed(self, value):
         """Callback para slider de archivos"""
+        if getattr(self, '_updating', False): return
+        
+        self._updating = True
         try:
             int_value = int(round(value))
             self.num_files_var.set(int_value)
             self.files_entry.delete(0, tk.END)
             self.files_entry.insert(0, str(int_value))
+            
+            # Lógica matemática: Recalcular páginas
+            if int_value > 0:
+                new_pages = math.ceil(self.analysis.total_pages / int_value)
+                self.pages_per_file_var.set(new_pages)
+                self.pages_slider.set(new_pages)
+                self.pages_entry.delete(0, tk.END)
+                self.pages_entry.insert(0, str(new_pages))
+            
             if not getattr(self, '_initializing', False):
                 self.update_calculations()
         except Exception as e:
             print(f"Error en slider callback: {e}")
+        finally:
+            self._updating = False
     
     def _on_files_entry_changed(self, event=None):
         """Callback para entry de archivos"""
+        if getattr(self, '_updating', False): return
+        
         try:
             value_str = self.files_entry.get().strip()
             if value_str and value_str.isdigit():
                 value = int(value_str)
                 if 1 <= value <= 20:
+                    self._updating = True  # Bloquear actualizaciones recursivas
+                    
                     self.num_files_var.set(value)
                     self.files_slider.set(value)
+                    
+                    # Lógica matemática: Recalcular páginas
+                    new_pages = math.ceil(self.analysis.total_pages / value)
+                    self.pages_per_file_var.set(new_pages)
+                    self.pages_slider.set(new_pages)
+                    self.pages_entry.delete(0, tk.END)
+                    self.pages_entry.insert(0, str(new_pages))
+                    
                     if not getattr(self, '_initializing', False):
                         self.update_calculations()
         except Exception as e:
             print(f"Error en entry callback: {e}")
+        finally:
+            self._updating = False
     
     def _on_pages_slider_changed(self, value):
         """Callback para slider de páginas"""
+        if getattr(self, '_updating', False): return
+        
+        self._updating = True
         try:
             int_value = int(round(value))
             self.pages_per_file_var.set(int_value)
             self.pages_entry.delete(0, tk.END)
             self.pages_entry.insert(0, str(int_value))
+            
+            # Lógica matemática: Recalcular archivos
+            if int_value > 0:
+                new_files = math.ceil(self.analysis.total_pages / int_value)
+                
+                # Actualizar sliders de archivos (dentro de límites prácticos)
+                new_files = max(1, min(20, new_files))  # Mantener dentro del rango del slider
+                
+                self.num_files_var.set(new_files)
+                self.files_slider.set(new_files)
+                self.files_entry.delete(0, tk.END)
+                self.files_entry.insert(0, str(new_files))
+            
             if not getattr(self, '_initializing', False):
                 self.update_calculations()
         except Exception as e:
             print(f"Error en pages slider callback: {e}")
+        finally:
+            self._updating = False
     
     def _on_pages_entry_changed(self, event=None):
         """Callback para entry de páginas"""
+        if getattr(self, '_updating', False): return
+        
         try:
             value_str = self.pages_entry.get().strip()
             if value_str and value_str.isdigit():
                 value = int(value_str)
                 max_pages = min(1000, self.analysis.total_pages)
                 if 10 <= value <= max_pages:
+                    self._updating = True
+                    
                     self.pages_per_file_var.set(value)
                     self.pages_slider.set(value)
+                    
+                    # Lógica matemática: Recalcular archivos
+                    new_files = math.ceil(self.analysis.total_pages / value)
+                    new_files = max(1, min(20, new_files))
+                    
+                    self.num_files_var.set(new_files)
+                    self.files_slider.set(new_files)
+                    self.files_entry.delete(0, tk.END)
+                    self.files_entry.insert(0, str(new_files))
+                    
                     if not getattr(self, '_initializing', False):
                         self.update_calculations()
         except Exception as e:
             print(f"Error en pages entry callback: {e}")
+        finally:
+            self._updating = False
     
     def update_calculations(self):
         """Actualizar cálculos en tiempo real"""
@@ -553,7 +617,7 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
             self.total_size_label.configure(text=f"📏 Total calculado: {total_pages_calculated:,} páginas")
             
             # Estado de validación
-            is_valid = mb_per_file <= 50.0 and pages_per_file <= 135
+            is_valid = mb_per_file <= LIMITS.safe_max_size_mb and pages_per_file <= LIMITS.safe_max_pages
             
             if is_valid:
                 self.status_label.configure(
@@ -562,10 +626,10 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
                 )
             else:
                 issues = []
-                if mb_per_file > 50.0:
-                    issues.append(f"MB excede límite ({mb_per_file:.1f} > 50)")
-                if pages_per_file > 135:
-                    issues.append(f"Páginas exceden límite ({pages_per_file} > 135)")
+                if mb_per_file > LIMITS.safe_max_size_mb:
+                    issues.append(f"MB excede límite ({mb_per_file:.1f} > {LIMITS.safe_max_size_mb:.1f})")
+                if pages_per_file > LIMITS.safe_max_pages:
+                    issues.append(f"Páginas exceden límite ({pages_per_file} > {LIMITS.safe_max_pages})")
                 
                 self.status_label.configure(
                     text=f"❌ {', '.join(issues)}",
@@ -616,9 +680,9 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
                 self._update_values(optimal.num_files, optimal.pages_per_file)
             else:
                 # Cálculo manual
-                optimal_files = math.ceil(self.analysis.total_size_mb / 45.0)
+                optimal_files = math.ceil(self.analysis.total_size_mb / (LIMITS.safe_max_size_mb * 0.9))
                 optimal_pages = math.ceil(self.analysis.total_pages / optimal_files)
-                self._update_values(optimal_files, min(optimal_pages, 135))
+                self._update_values(optimal_files, min(optimal_pages, LIMITS.safe_max_pages))
             
         except Exception as e:
             messagebox.showerror("Error", f"Error calculando división óptima: {e}")
@@ -631,7 +695,7 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
     
     def apply_fast(self):
         """Aplicar configuración rápida (2 archivos)"""
-        pages = min(math.ceil(self.analysis.total_pages / 2), 135)
+        pages = min(math.ceil(self.analysis.total_pages / 2), LIMITS.safe_max_pages)
         self._update_values(2, pages)
     
     def apply_conservative(self):
@@ -668,11 +732,11 @@ class AdvancedSplitControlDialog(ctk.CTkToplevel):
         """Aplicar ajuste automático"""
         try:
             if self.validation_summary:
-                recommended_files = self.validation_summary.recommended_total_files or math.ceil(self.analysis.total_size_mb / 45.0)
+                recommended_files = self.validation_summary.recommended_total_files or math.ceil(self.analysis.total_size_mb / (LIMITS.safe_max_size_mb * 0.9))
             else:
-                recommended_files = math.ceil(self.analysis.total_size_mb / 45.0)
+                recommended_files = math.ceil(self.analysis.total_size_mb / (LIMITS.safe_max_size_mb * 0.9))
             
-            recommended_pages = min(math.ceil(self.analysis.total_pages / recommended_files), 135)
+            recommended_pages = min(math.ceil(self.analysis.total_pages / recommended_files), LIMITS.safe_max_pages)
             
             self.result = InteractiveSplitResult(
                 action='split',

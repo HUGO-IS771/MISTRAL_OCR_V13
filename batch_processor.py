@@ -115,8 +115,8 @@ class OCRBatchProcessor:
     """
 
     # Usar límites centralizados
-    MAX_SIZE_MB = LIMITS.SAFE_MAX_SIZE_MB
-    MAX_PAGES = LIMITS.SAFE_MAX_PAGES
+    MAX_SIZE_MB = LIMITS.safe_max_size_mb
+    MAX_PAGES = LIMITS.safe_max_pages
 
     def __init__(self, ocr_client, max_workers: int = 3, app=None):
         """
@@ -410,7 +410,7 @@ class OCRBatchProcessor:
             from pre_division_validator import PreDivisionValidator
             from pre_division_dialog import show_pre_division_dialog
 
-            pre_validator = PreDivisionValidator(max_size_mb=LIMITS.SAFE_MAX_SIZE_MB)
+            pre_validator = PreDivisionValidator(max_size_mb=LIMITS.safe_max_size_mb)
             file_path = Path(file_info['path'])
 
             is_safe, analysis = pre_validator.validate_before_split(file_path, num_files_target)
@@ -535,10 +535,9 @@ class OCRBatchProcessor:
                     },
                     "model": config.get('model', 'mistral-ocr-latest'),
                     "include_image_base64": include_images,
-                    # NOTA: Parámetros no soportados en versión actual de Mistral API SDK
-                    # "table_format": "html",
-                    # "extract_header": True,
-                    # "extract_footer": True
+                    "table_format": config.get("table_format", "html"),
+                    "extract_header": config.get("extract_header", False),
+                    "extract_footer": config.get("extract_footer", False)
                 }
 
                 if getattr(self.ocr_client, 'enable_bbox_annotations', False):

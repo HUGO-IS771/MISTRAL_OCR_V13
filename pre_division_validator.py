@@ -5,7 +5,9 @@ Pre-Division Validator - Validación ANTES de Crear Archivos
 Sistema que calcula y valida tamaños estimados ANTES de dividir físicamente
 el PDF, evitando crear archivos innecesarios que excedan límites.
 
-Versión: 1.0.0 - Validación Preventiva
+REFACTORIZADO: Ahora usa core_analyzer.py para eliminar código duplicado.
+
+Versión: 2.0.0 - Integrado con FileAnalyzer
 Funcionalidad: Estimación precisa de tamaños pre-división
 """
 
@@ -16,6 +18,8 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import logging
 import math
+from core_analyzer import FileAnalyzer, SplitLimits, FileMetrics, SplitAnalysis, SplitPlan
+from processing_limits import LIMITS
 
 # Configuración
 logging.basicConfig(level=logging.INFO)
@@ -45,44 +49,47 @@ class PreDivisionAnalysis:
     size_efficiency: float
     
 class PreDivisionValidator:
-    """Validador que estima tamaños ANTES de crear archivos físicos"""
-    
+    """
+    Validador que estima tamaños ANTES de crear archivos físicos
+
+    REFACTORIZADO: Usa FileAnalyzer de core_analyzer.py internamente.
+    """
+
     def __init__(self, max_size_mb: float = 50.0, max_pages: int = 135):
         self.max_size_mb = max_size_mb
         self.max_pages = max_pages
+
+        # Usar FileAnalyzer internamente
+        self.limits = SplitLimits(max_size_mb=max_size_mb, max_pages=max_pages)
+        self.analyzer = FileAnalyzer(self.limits)
+
         logger.info(f"Pre-validator inicializado: {max_size_mb}MB, {max_pages} páginas máx")
     
-    def analyze_division_plan(self, file_path: Path, num_files: int, 
+    def analyze_division_plan(self, file_path: Path, num_files: int,
                             pages_per_file: Optional[List[int]] = None) -> PreDivisionAnalysis:
         """
         Analizar plan de división ANTES de crear archivos físicos
-        
+
+        REFACTORIZADO: Usa FileAnalyzer.get_file_metrics() para análisis base
+
         Args:
             file_path: Ruta del archivo original
             num_files: Número de archivos a crear
             pages_per_file: Lista opcional de páginas por archivo
-            
+
         Returns:
             PreDivisionAnalysis con estimaciones detalladas
         """
         if not file_path.exists():
             raise FileNotFoundError(f"Archivo no encontrado: {file_path}")
-        
-        # Obtener información básica
-        original_size_mb = file_path.stat().st_size / (1024 * 1024)
-        
-        # Estimar páginas si no se proporcionan
-        try:
-            from PyPDF2 import PdfReader
-            pdf = PdfReader(file_path)
-            total_pages = len(pdf.pages)
-        except Exception as e:
-            logger.warning(f"No se pudo leer PDF, estimando páginas: {e}")
-            # Estimación basada en tamaño (aproximadamente 4 páginas por MB)
-            total_pages = max(1, int(original_size_mb * 4))
-        
+
+        # Usar FileAnalyzer para obtener métricas (elimina código duplicado)
+        metrics = FileAnalyzer.get_file_metrics(file_path)
+        original_size_mb = metrics.size_mb
+        total_pages = metrics.total_pages
+
         logger.info(f"Analizando división: {original_size_mb:.1f}MB, {total_pages} páginas → {num_files} archivos")
-        
+
         # Calcular distribución de páginas
         if pages_per_file:
             if len(pages_per_file) != num_files:
@@ -93,31 +100,30 @@ class PreDivisionValidator:
             base_pages = total_pages // num_files
             extra_pages = total_pages % num_files
             pages_distribution = [base_pages + (1 if i < extra_pages else 0) for i in range(num_files)]
-        
+
         # Estimar tamaños de archivos resultantes
         estimated_files = []
         files_exceeding_limits = 0
         size_per_page = original_size_mb / total_pages
-        
+
         current_page = 1
         for i in range(num_files):
             pages = pages_distribution[i]
             estimated_size = pages * size_per_page
-            
+
             # Agregar overhead de PDF (headers, estructura, etc.)
-            # Típicamente 2-5% del tamaño original
             overhead_factor = 1.03
             estimated_size *= overhead_factor
-            
+
             exceeds_limit = estimated_size > self.max_size_mb
             if exceeds_limit:
                 files_exceeding_limits += 1
-            
+
             # Calcular división recomendada para este archivo si excede
             recommended_split = None
             if exceeds_limit:
                 recommended_split = math.ceil(estimated_size / self.max_size_mb)
-            
+
             estimated_file = EstimatedFile(
                 index=i,
                 estimated_size_mb=estimated_size,
@@ -126,18 +132,19 @@ class PreDivisionValidator:
                 exceeds_limit=exceeds_limit,
                 recommended_split=recommended_split
             )
-            
+
             estimated_files.append(estimated_file)
             current_page += pages
-        
-        # Calcular número recomendado de archivos
-        recommended_num_files = self._calculate_optimal_files(original_size_mb, total_pages)
-        
+
+        # Usar FileAnalyzer para calcular número óptimo (elimina código duplicado)
+        analysis = self.analyzer.analyze_split_needs(metrics)
+        recommended_num_files = analysis.required_files
+
         # Calcular eficiencia de tamaño
         max_estimated_size = max(f.estimated_size_mb for f in estimated_files)
         size_efficiency = min(1.0, self.max_size_mb / max_estimated_size) if max_estimated_size > 0 else 1.0
-        
-        analysis = PreDivisionAnalysis(
+
+        result = PreDivisionAnalysis(
             original_file=file_path,
             original_size_mb=original_size_mb,
             total_pages=total_pages,
@@ -148,19 +155,24 @@ class PreDivisionValidator:
             recommended_num_files=recommended_num_files,
             size_efficiency=size_efficiency
         )
-        
+
         logger.info(f"Pre-análisis completado: {files_exceeding_limits}/{num_files} archivos excederán límites")
-        
-        return analysis
-    
+
+        return result
+
     def _calculate_optimal_files(self, size_mb: float, total_pages: int) -> int:
-        """Calcular número óptimo de archivos"""
+        """
+        Calcular número óptimo de archivos
+
+        DEPRECATED: Usar FileAnalyzer.analyze_split_needs() en su lugar
+        Mantenido por compatibilidad interna
+        """
         # Basado en tamaño
-        size_based = math.ceil(size_mb / (self.max_size_mb * 0.9))  # 90% del límite para margen
-        
+        size_based = math.ceil(size_mb / (self.max_size_mb * 0.9))
+
         # Basado en páginas
-        page_based = math.ceil(total_pages / (self.max_pages * 0.9))  # 90% del límite para margen
-        
+        page_based = math.ceil(total_pages / (self.max_pages * 0.9))
+
         # Tomar el mayor para garantizar que ambos límites se respeten
         return max(size_based, page_based)
     
@@ -301,7 +313,7 @@ def test_pre_division_validator():
         test_file = Path(tmp.name)
     
     try:
-        validator = PreDivisionValidator(max_size_mb=50.0)
+        validator = PreDivisionValidator(max_size_mb=LIMITS.SAFE_MAX_SIZE_MB)
         
         # Probar con 5 archivos (que debería fallar)
         print("=== PRUEBA: División en 5 archivos ===")

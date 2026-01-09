@@ -2,33 +2,59 @@
 """
 Batch Optimizer - Optimizador inteligente de procesamiento por lotes
 Analiza archivos PDF y recomienda la mejor estrategia de división.
+
+NOTA: Este módulo ahora usa core_analyzer.py para eliminar código duplicado.
+Las clases PDFAnalysis y SplitRecommendation se mantienen por compatibilidad.
 """
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+from core_analyzer import FileAnalyzer, SplitLimits, FileMetrics, SplitAnalysis, SplitPlan
+from processing_limits import LIMITS
 
 
 @dataclass
 class PDFAnalysis:
-    """Análisis detallado de un archivo PDF."""
+    """
+    Análisis detallado de un archivo PDF.
+
+    DEPRECATED: Usar FileMetrics y SplitAnalysis de core_analyzer.py
+    Esta clase se mantiene por compatibilidad con código existente.
+    """
     file_path: Path
     total_size_mb: float
     total_pages: int
     density_mb_per_page: float
     requires_splitting: bool
     reason: str = ""
-    
+
     @property
     def size_gb(self) -> float:
         """Tamaño en GB para archivos grandes."""
         return self.total_size_mb / 1024
 
+    @staticmethod
+    def from_core_analysis(metrics: FileMetrics, analysis: SplitAnalysis) -> 'PDFAnalysis':
+        """Crea PDFAnalysis desde análisis de core_analyzer"""
+        return PDFAnalysis(
+            file_path=metrics.file_path,
+            total_size_mb=metrics.size_mb,
+            total_pages=metrics.total_pages,
+            density_mb_per_page=metrics.density_mb_per_page,
+            requires_splitting=analysis.requires_splitting,
+            reason=analysis.reason
+        )
+
 
 @dataclass
 class SplitRecommendation:
-    """Recomendación de división optimizada."""
+    """
+    Recomendación de división optimizada.
+
+    DEPRECATED: Usar SplitPlan de core_analyzer.py
+    Esta clase se mantiene por compatibilidad con código existente.
+    """
     num_files: int
     pages_per_file: int
     estimated_mb_per_file: float
@@ -37,130 +63,118 @@ class SplitRecommendation:
     strategy: str
     efficiency_score: float
     warnings: List[str]
-    
+
     @property
     def is_optimal(self) -> bool:
         """Verifica si la recomendación es óptima."""
-        return (self.estimated_mb_per_file <= 50 and 
-                self.pages_per_file <= 150 and
+        return (self.estimated_mb_per_file <= LIMITS.safe_max_size_mb and
+                self.pages_per_file <= LIMITS.safe_max_pages and
                 self.efficiency_score >= 0.8)
+
+    @staticmethod
+    def from_split_plan(plan: SplitPlan) -> 'SplitRecommendation':
+        """Crea SplitRecommendation desde SplitPlan de core_analyzer"""
+        return SplitRecommendation(
+            num_files=plan.num_files,
+            pages_per_file=plan.pages_per_file,
+            estimated_mb_per_file=plan.estimated_mb_per_file,
+            total_pages=plan.total_pages,
+            total_size_mb=plan.total_size_mb,
+            strategy=plan.strategy,
+            efficiency_score=plan.efficiency_score,
+            warnings=plan.warnings
+        )
 
 
 class BatchOptimizer:
-    """Optimizador inteligente para procesamiento por lotes."""
+    """
+    Optimizador inteligente para procesamiento por lotes.
 
-    # Límites de la API (optimizados para mejor rendimiento)
-    MAX_SIZE_MB = 48.0  # Aumentado de 45MB a 48MB (96% del límite API de 50MB)
-    MAX_PAGES = 145     # Aumentado de 135 a 145 páginas (97% del límite API de 150)
+    REFACTORIZADO: Ahora usa FileAnalyzer de core_analyzer.py internamente.
+    La interfaz pública se mantiene igual por compatibilidad.
 
-    # Factores de seguridad (un solo margen, más eficiente)
-    SAFETY_FACTOR_SIZE = 0.97  # 97% del límite (aumentado de 95%)
-    SAFETY_FACTOR_PAGES = 0.97  # 97% del límite de páginas (sin cambio)
+    LÍMITES: Ahora obtiene límites de processing_limits.py para consistencia.
+    """
 
-    # Overhead estimado por archivo PDF
-    PDF_OVERHEAD_MB = 0.5
-    
     def __init__(self):
-        self.safe_max_size = self.MAX_SIZE_MB * self.SAFETY_FACTOR_SIZE
-        self.safe_max_pages = int(self.MAX_PAGES * self.SAFETY_FACTOR_PAGES)
-    
+        # Usar límites centralizados desde processing_limits
+        self.limits = SplitLimits(
+            max_size_mb=LIMITS.SAFE_MAX_SIZE_MB,
+            max_pages=LIMITS.SAFE_MAX_PAGES,
+            safety_factor_size=LIMITS.SAFETY_FACTOR_SIZE,
+            safety_factor_pages=LIMITS.SAFETY_FACTOR_PAGES,
+            pdf_overhead_mb=LIMITS.PDF_OVERHEAD_MB
+        )
+        self.analyzer = FileAnalyzer(self.limits)
+
+        # Mantener compatibilidad con código legacy
+        self.safe_max_size = self.limits.safe_max_size
+        self.safe_max_pages = self.limits.safe_max_pages
+
+        # Aliases para compatibilidad
+        self.MAX_SIZE_MB = LIMITS.SAFE_MAX_SIZE_MB
+        self.MAX_PAGES = LIMITS.SAFE_MAX_PAGES
+        self.SAFETY_FACTOR_SIZE = LIMITS.SAFETY_FACTOR_SIZE
+        self.SAFETY_FACTOR_PAGES = LIMITS.SAFETY_FACTOR_PAGES
+        self.PDF_OVERHEAD_MB = LIMITS.PDF_OVERHEAD_MB
+
     def analyze_pdf(self, file_path: str, total_pages: int) -> PDFAnalysis:
-        """Analiza un archivo PDF y determina si necesita división."""
+        """
+        Analiza un archivo PDF y determina si necesita división.
+
+        REFACTORIZADO: Usa FileAnalyzer.get_file_metrics() y analyze_split_needs()
+        """
         path = Path(file_path)
-        size_mb = path.stat().st_size / (1024 * 1024)
-        density = size_mb / total_pages if total_pages > 0 else 0
-        
-        # Determinar si requiere división
-        requires_split = False
-        reason = ""
-        
-        if size_mb > self.MAX_SIZE_MB:
-            requires_split = True
-            reason = f"Tamaño excede límite ({size_mb:.1f}MB > {self.MAX_SIZE_MB}MB)"
-        elif total_pages > self.MAX_PAGES:
-            requires_split = True
-            reason = f"Páginas exceden límite ({total_pages} > {self.MAX_PAGES})"
-        
-        return PDFAnalysis(
-            file_path=path,
-            total_size_mb=size_mb,
-            total_pages=total_pages,
-            density_mb_per_page=density,
-            requires_splitting=requires_split,
-            reason=reason
-        )
-    
+
+        # Usar FileAnalyzer para obtener métricas (elimina código duplicado)
+        metrics = FileAnalyzer.get_file_metrics(path, total_pages)
+        analysis = self.analyzer.analyze_split_needs(metrics)
+
+        # Convertir a PDFAnalysis para compatibilidad
+        return PDFAnalysis.from_core_analysis(metrics, analysis)
+
     def calculate_optimal_split(self, analysis: PDFAnalysis) -> SplitRecommendation:
-        """Calcula la división óptima basada en peso y páginas."""
-        if not analysis.requires_splitting:
-            return self._no_split_recommendation(analysis)
-        
-        # Calcular divisiones mínimas requeridas
-        min_files_by_size = math.ceil(analysis.total_size_mb / self.safe_max_size)
-        min_files_by_pages = math.ceil(analysis.total_pages / self.safe_max_pages)
-        
-        # El número real debe satisfacer ambas restricciones
-        required_files = max(min_files_by_size, min_files_by_pages)
-        
-        # Intentar encontrar una división balanceada
-        best_recommendation = None
-        best_score = 0
-        
-        # Probar diferentes números de archivos
-        for num_files in range(required_files, required_files + 3):
-            recommendation = self._evaluate_split(analysis, num_files)
-            if recommendation.efficiency_score > best_score:
-                best_score = recommendation.efficiency_score
-                best_recommendation = recommendation
-        
-        return best_recommendation
-    
-    def _evaluate_split(self, analysis: PDFAnalysis, num_files: int) -> SplitRecommendation:
-        """Evalúa una configuración de división específica."""
-        pages_per_file = math.ceil(analysis.total_pages / num_files)
-        mb_per_file = (analysis.total_size_mb / num_files) + self.PDF_OVERHEAD_MB
-        
-        warnings = []
-        strategy = "balanced"
-        
-        # Verificar límites
-        if mb_per_file > self.safe_max_size:
-            warnings.append(f"Archivos pueden exceder límite de tamaño ({mb_per_file:.1f}MB)")
-            strategy = "size-constrained"
-        
-        if pages_per_file > self.safe_max_pages:
-            warnings.append(f"Archivos pueden exceder límite de páginas ({pages_per_file})")
-            strategy = "page-constrained"
-        
-        # Calcular puntuación de eficiencia
-        size_efficiency = min(1.0, self.safe_max_size / mb_per_file)
-        page_efficiency = min(1.0, self.safe_max_pages / pages_per_file)
-        balance_score = 1.0 - (abs(size_efficiency - page_efficiency) * 0.5)
-        
-        # Penalizar por demasiados archivos
-        file_penalty = max(0, (num_files - 5) * 0.05)
-        
-        efficiency_score = (size_efficiency * 0.4 + 
-                          page_efficiency * 0.4 + 
-                          balance_score * 0.2) - file_penalty
-        
-        # Ajustar estrategia basada en densidad
-        if analysis.density_mb_per_page > 1.0:
-            strategy = "high-density" if strategy == "balanced" else f"{strategy}-high-density"
-        elif analysis.density_mb_per_page < 0.1:
-            strategy = "low-density" if strategy == "balanced" else f"{strategy}-low-density"
-        
-        return SplitRecommendation(
-            num_files=num_files,
-            pages_per_file=pages_per_file,
-            estimated_mb_per_file=mb_per_file,
+        """
+        Calcula la división óptima basada en peso y páginas.
+
+        REFACTORIZADO: Usa FileAnalyzer.get_optimal_split_plan()
+        """
+        # Crear análisis de core_analyzer desde PDFAnalysis legacy
+        metrics = FileMetrics(
+            file_path=analysis.file_path,
+            size_mb=analysis.total_size_mb,
             total_pages=analysis.total_pages,
-            total_size_mb=analysis.total_size_mb,
-            strategy=strategy,
-            efficiency_score=efficiency_score,
-            warnings=warnings
+            density_mb_per_page=analysis.density_mb_per_page
         )
-    
+        split_analysis = self.analyzer.analyze_split_needs(metrics)
+
+        # Obtener plan óptimo
+        plan = self.analyzer.get_optimal_split_plan(split_analysis)
+
+        # Convertir a SplitRecommendation para compatibilidad
+        return SplitRecommendation.from_split_plan(plan)
+
+    def _evaluate_split(self, analysis: PDFAnalysis, num_files: int) -> SplitRecommendation:
+        """
+        Evalúa una configuración de división específica.
+
+        REFACTORIZADO: Usa FileAnalyzer.calculate_split_plan()
+        """
+        # Crear análisis de core_analyzer
+        metrics = FileMetrics(
+            file_path=analysis.file_path,
+            size_mb=analysis.total_size_mb,
+            total_pages=analysis.total_pages,
+            density_mb_per_page=analysis.density_mb_per_page
+        )
+        split_analysis = self.analyzer.analyze_split_needs(metrics)
+
+        # Calcular plan específico
+        plan = self.analyzer.calculate_split_plan(split_analysis, num_files)
+
+        # Convertir a SplitRecommendation
+        return SplitRecommendation.from_split_plan(plan)
+
     def _no_split_recommendation(self, analysis: PDFAnalysis) -> SplitRecommendation:
         """Recomendación cuando no se requiere división."""
         return SplitRecommendation(
@@ -173,67 +187,46 @@ class BatchOptimizer:
             efficiency_score=1.0,
             warnings=[]
         )
-    
+
     def get_alternative_recommendations(self, analysis: PDFAnalysis) -> List[SplitRecommendation]:
-        """Genera recomendaciones alternativas para el usuario."""
-        if not analysis.requires_splitting:
-            return [self._no_split_recommendation(analysis)]
-        
-        alternatives = []
-        
-        # Opción 1: Mínimo número de archivos
-        min_files = max(
-            math.ceil(analysis.total_size_mb / self.safe_max_size),
-            math.ceil(analysis.total_pages / self.safe_max_pages)
+        """
+        Genera recomendaciones alternativas para el usuario.
+
+        REFACTORIZADO: Usa FileAnalyzer.get_alternative_plans()
+        """
+        # Crear análisis de core_analyzer
+        metrics = FileMetrics(
+            file_path=analysis.file_path,
+            size_mb=analysis.total_size_mb,
+            total_pages=analysis.total_pages,
+            density_mb_per_page=analysis.density_mb_per_page
         )
-        alternatives.append(self._evaluate_split(analysis, min_files))
-        
-        # Opción 2: Archivos más pequeños para mejor procesamiento
-        comfort_files = min_files + 1
-        alternatives.append(self._evaluate_split(analysis, comfort_files))
-        
-        # Opción 3: División por capítulos comunes (50, 100 páginas)
-        for chunk_size in [50, 100]:
-            if chunk_size < analysis.total_pages:
-                num_files = math.ceil(analysis.total_pages / chunk_size)
-                rec = self._evaluate_split(analysis, num_files)
-                if rec.is_optimal:
-                    alternatives.append(rec)
-        
-        # Ordenar por puntuación
-        alternatives.sort(key=lambda x: x.efficiency_score, reverse=True)
-        
-        # Eliminar duplicados
-        seen = set()
-        unique_alternatives = []
-        for alt in alternatives:
-            key = (alt.num_files, alt.pages_per_file)
-            if key not in seen:
-                seen.add(key)
-                unique_alternatives.append(alt)
-        
-        return unique_alternatives[:3]  # Top 3 opciones
+        split_analysis = self.analyzer.analyze_split_needs(metrics)
+
+        # Obtener planes alternativos
+        plans = self.analyzer.get_alternative_plans(split_analysis)
+
+        # Convertir a SplitRecommendation
+        return [SplitRecommendation.from_split_plan(plan) for plan in plans]
     
     def format_recommendation(self, rec: SplitRecommendation) -> str:
-        """Formatea una recomendación para mostrar al usuario."""
-        lines = []
-        
-        if rec.num_files == 1:
-            lines.append("✅ No se requiere división")
-            lines.append(f"   El archivo puede procesarse directamente")
-        else:
-            lines.append(f"📊 División recomendada: {rec.num_files} archivos")
-            lines.append(f"   • Páginas por archivo: {rec.pages_per_file}")
-            lines.append(f"   • Tamaño estimado por archivo: {rec.estimated_mb_per_file:.1f} MB")
-            lines.append(f"   • Estrategia: {rec.strategy}")
-            lines.append(f"   • Puntuación de eficiencia: {rec.efficiency_score:.0%}")
-        
-        if rec.warnings:
-            lines.append("   ⚠️ Advertencias:")
-            for warning in rec.warnings:
-                lines.append(f"      - {warning}")
-        
-        return "\n".join(lines)
+        """
+        Formatea una recomendación para mostrar al usuario.
+
+        REFACTORIZADO: Usa FileAnalyzer.format_plan()
+        """
+        # Convertir a SplitPlan y usar format_plan
+        plan = SplitPlan(
+            num_files=rec.num_files,
+            pages_per_file=rec.pages_per_file,
+            estimated_mb_per_file=rec.estimated_mb_per_file,
+            total_pages=rec.total_pages,
+            total_size_mb=rec.total_size_mb,
+            strategy=rec.strategy,
+            efficiency_score=rec.efficiency_score,
+            warnings=rec.warnings
+        )
+        return self.analyzer.format_plan(plan)
     
     def get_summary_report(self, analysis: PDFAnalysis, 
                           recommendations: List[SplitRecommendation]) -> str:

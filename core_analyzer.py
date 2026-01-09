@@ -14,10 +14,11 @@ Versión: 1.0.0 - Consolidación Fase 1
 """
 
 import math
+import logging
 from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
-import logging
+from processing_limits import LIMITS
 
 logger = logging.getLogger('core_analyzer')
 
@@ -39,11 +40,11 @@ class FileMetrics:
 @dataclass
 class SplitLimits:
     """Límites configurables para división de archivos"""
-    max_size_mb: float = 48.0
-    max_pages: int = 145
-    safety_factor_size: float = 0.97
-    safety_factor_pages: float = 0.97
-    pdf_overhead_mb: float = 0.5
+    max_size_mb: float = LIMITS.safe_max_size_mb
+    max_pages: int = LIMITS.safe_max_pages
+    safety_factor_size: float = LIMITS.SAFETY_FACTOR_SIZE
+    safety_factor_pages: float = LIMITS.SAFETY_FACTOR_PAGES
+    pdf_overhead_mb: float = LIMITS.PDF_OVERHEAD_MB
 
     @property
     def safe_max_size(self) -> float:
@@ -93,8 +94,8 @@ class SplitPlan:
     @property
     def is_optimal(self) -> bool:
         """Verifica si el plan es óptimo"""
-        return (self.estimated_mb_per_file <= 50 and
-                self.pages_per_file <= 150 and
+        return (self.estimated_mb_per_file <= LIMITS.safe_max_size_mb and
+                self.pages_per_file <= LIMITS.safe_max_pages and
                 self.efficiency_score >= 0.8)
 
 

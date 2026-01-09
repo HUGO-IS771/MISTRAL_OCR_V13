@@ -30,25 +30,31 @@ OCR application using Mistral AI API for processing PDFs and images into markdow
 - Pre-division and post-split validation dialogs
 - Automatic cleanup of temporary split files
 
+### Centralized Limits (Single Source of Truth)
+
+**processing_limits.py** - All API limits are defined here
+- `ProcessingLimits` frozen dataclass with all limits
+- `LIMITS` global singleton instance - import and use this
+- Deprecated aliases emit warnings for backward compatibility
+- Safe limits are calculated dynamically from API limits × safety factors
+
+**core_analyzer.py** - Unified file analysis logic
+- `FileAnalyzer` class consolidates all analysis from batch_optimizer, pre_division_validator, pdf_split_validator
+- `FileMetrics`, `SplitAnalysis`, `SplitPlan` dataclasses
+- `quick_analyze()` convenience function for one-line analysis
+
 ### Optimization Layer
 
 **batch_optimizer.py** - Intelligent file splitting
-- `PDFAnalysis` dataclass: file analysis results
-- `SplitRecommendation` dataclass: optimal split strategy
-- `BatchOptimizer` class calculates splits based on:
-  - File size limit: 45MB (with 95% safety factor)
-  - Page limit: 135 pages (with 97% safety factor)
-  - Density analysis (MB per page)
+- `PDFAnalysis` and `SplitRecommendation` dataclasses
+- `BatchOptimizer` calculates splits using limits from `processing_limits.py`
 
 **multi_batch_processor.py** - Multi-file coordination
 - `MultiBatchProcessor` handles multiple PDFs with continuous page numbering
-- Generates unified output from split files
-- Tracks processing across file boundaries
 
 **performance_optimizer.py** - Concurrency optimization
 - `PerformanceConfig` for adaptive worker allocation
 - Groups files by size (small <10MB, medium 10-30MB, large >30MB)
-- Adjusts concurrency based on total workload
 
 **text_md_optimization.py** - Post-processing
 - `TextOptimizer` for OCR text cleanup
@@ -58,25 +64,29 @@ OCR application using Mistral AI API for processing PDFs and images into markdow
 ### Validation Layer
 
 **pre_division_validator.py** + **pre_division_dialog.py** - Pre-split validation
-- Validates file before splitting
-- Shows analysis and recommendations in UI dialog
-
 **pdf_split_validator.py** + **post_split_validation_dialog.py** - Post-split validation
-- Verifies split files integrity
-- Confirms page counts and file sizes
-
-**split_control_dialog.py** - Advanced split control
-- Custom split configuration UI
-- Manual override of automatic recommendations
-
+**split_control_dialog.py** - Advanced split control with manual override
 **file_cleanup_manager.py** - Temporary file management
-- Tracks split files created during processing
-- Automatic cleanup after successful processing
 
 ## Key Design Patterns
 
+### Centralized Limits Access
+Always import limits from the central module:
+```python
+from processing_limits import LIMITS
+
+# Access calculated safe limits
+max_size = LIMITS.safe_max_size_mb  # 96 MB (100 × 0.96)
+max_pages = LIMITS.safe_max_pages   # 900 (1000 × 0.90)
+
+# Check limits
+result = LIMITS.check_limits(size_mb=50, pages=200)
+if not result.within_limits:
+    print(result.exceeded)  # List of exceeded limits
+```
+
 ### Dataclass-Based Configuration
-All major data structures use dataclasses for type safety and clarity:
+All major data structures use dataclasses:
 ```python
 @dataclass
 class PDFAnalysis:
@@ -86,25 +96,17 @@ class PDFAnalysis:
     density_mb_per_page: float
     requires_splitting: bool
     reason: str = ""
-
-@dataclass
-class ProcessingConfig:
-    api_key: str
-    model: str = "mistral-ocr-latest"
-    max_size_mb: float = 50.0
-    max_pages: int = 135
-    optimize: bool = True
 ```
 
 ### Unified Processing Flow
-All file processing follows the same pattern:
-1. Analyze file → `BatchOptimizer.analyze_pdf()`
-2. Recommend split (if needed) → `BatchOptimizer.calculate_optimal_split()`
-3. Process → `MistralOCRClient.process_file()`
-4. Save → `MistralOCRClient.save_as_markdown()`
+1. Analyze file → `FileAnalyzer.get_file_metrics()` or `BatchOptimizer.analyze_pdf()`
+2. Check split needs → `FileAnalyzer.analyze_split_needs()`
+3. Calculate split → `FileAnalyzer.get_optimal_split_plan()`
+4. Process → `MistralOCRClient.process_file()`
+5. Save → `MistralOCRClient.save_as_markdown()`
 
 ### Separation of Concerns
-- **Logic modules** (batch_optimizer, performance_optimizer): Pure functions, no UI
+- **Logic modules** (batch_optimizer, performance_optimizer, core_analyzer): Pure functions, no UI
 - **Dialog modules** (*_dialog.py): UI components that call logic modules
 - **Manager modules** (*_processor.py, *_validator.py): Coordinate between logic and UI
 
@@ -112,10 +114,7 @@ All file processing follows the same pattern:
 
 ### Setup
 ```bash
-# Install dependencies (includes mistralai)
 pip install -r requirements.txt
-
-# Configure API key
 echo MISTRAL_API_KEY=your_api_key_here > .env
 ```
 
@@ -126,86 +125,55 @@ MISTRAL_OCR_LAUNCHER.bat
 
 # Or run GUI directly
 python mistral_ocr_gui_optimized.py
-
-# Run purge utility
-python purge_application.py
 ```
 
 ## Mistral API Integration
 
-### Critical Constraints
-The application is designed around Mistral API limitations:
-- **File size**: 50MB absolute limit, 45MB working limit (95% safety factor)
-- **Page count**: 150 pages absolute limit, 135 pages working limit (97% safety factor)
-- **Rate limiting**: 2-4 second delays between requests
+### Critical Constraints (from processing_limits.py)
+- **File size**: 100MB absolute limit, 96MB safe limit (96% safety factor)
+- **Page count**: 1000 pages absolute limit, 900 pages safe limit (90% safety factor)
+- **Rate limiting**: 2 second delays between requests
 - **Upload URL caching**: 50 minute cache lifetime
-
-### Processing Flow
-1. File upload → Mistral API (returns URL cached for 50 mins)
-2. OCR request → Mistral API with cached URL
-3. Response parsing → Extract text and embedded images
-4. Text optimization → Domain-specific cleanup
-5. Save → Markdown file with optional embedded images
 
 ### Programmatic Usage
 ```python
 from mistral_ocr_client_optimized import MistralOCRClient
 
-# Basic usage
 client = MistralOCRClient()
 response = client.process_file("document.pdf")
 client.save_as_markdown(response, "output.md")
 
 # With optimization
 client.save_as_markdown(
-    response,
-    "output.md",
+    response, "output.md",
     optimize=True,
     domain="legal",  # or "medical", "technical", "general"
     enrich_images=True
 )
 
-# Export to premium HTML with embedded images
-client.save_as_html(
-    response,
-    "output.html",
-    title="Mi Documento",
-    theme="light"  # or "dark"
-)
+# Export to HTML
+client.save_as_html(response, "output.html", title="Document", theme="light")
 ```
 
-### Batch Processing Example
+### Quick Analysis Example
 ```python
-from batch_optimizer import BatchOptimizer
-from mistral_ocr_client_optimized import MistralOCRClient
+from core_analyzer import quick_analyze
 
-# Analyze and split large file
-optimizer = BatchOptimizer()
-analysis = optimizer.analyze_pdf("large_doc.pdf", pages_count=300)
-
+metrics, analysis, plan = quick_analyze("large_doc.pdf")
 if analysis.requires_splitting:
-    recommendation = optimizer.calculate_optimal_split(analysis)
-    # recommendation.num_files, recommendation.pages_per_file
-    # Use these values to split the PDF
+    print(f"Split into {plan.num_files} files, {plan.pages_per_file} pages each")
 ```
 
 ## Important Limits and Behaviors
 
 ### File Splitting Logic
 Files are split when either condition is met:
-- Size exceeds 45MB (safety margin below 50MB API limit)
-- Pages exceed 135 (safety margin below 150 page API limit)
-
-Split calculations prioritize:
-1. Staying under limits with safety margin
-2. Creating equal-sized chunks
-3. Minimizing number of splits (fewer API calls)
+- Size exceeds 96MB (safe margin below 100MB API limit)
+- Pages exceed 900 (safe margin below 1000 page API limit)
 
 ### Supported File Formats
 - **PDF**: .pdf
 - **Images**: .jpg, .jpeg, .png, .tiff, .tif
-
-MIME types are registered at module import in mistral_ocr_client_optimized.py
 
 ### Text Optimization Domains
 - **legal**: Legal documents (contract clauses, legal citations)
@@ -215,24 +183,22 @@ MIME types are registered at module import in mistral_ocr_client_optimized.py
 
 ## Development Notes
 
+### Modifying Limits
+Edit only `processing_limits.py`:
+```python
+@dataclass(frozen=True)
+class ProcessingLimits:
+    API_MAX_SIZE_MB: float = 100.0   # Change API limits here
+    API_MAX_PAGES: int = 1000
+    SAFETY_FACTOR_SIZE: float = 0.96  # Change safety factors here
+    SAFETY_FACTOR_PAGES: float = 0.90
+```
+
 ### Adding New Validation Dialogs
-Dialog modules follow this pattern:
 1. Import validation logic from corresponding *_validator.py
-2. Create CustomTkinter dialog class
+2. Create CustomTkinter dialog class extending `base_dialog.py`
 3. Call logic methods and display results
 4. Return user decision (proceed/cancel/modify)
-
-### Extending Batch Optimizer
-To modify split logic:
-- Edit `BatchOptimizer` class in batch_optimizer.py
-- Adjust `MAX_SIZE_MB` and `MAX_PAGES` constants
-- Modify `SAFETY_FACTOR_SIZE` and `SAFETY_FACTOR_PAGES` for margins
-
-### Error Handling Strategy
-- File validation errors → Show dialog, prevent processing
-- API errors → Retry with exponential backoff
-- Split validation errors → Show issues, allow user override
-- Cleanup errors → Log warning, continue
 
 ## Environment Requirements
 

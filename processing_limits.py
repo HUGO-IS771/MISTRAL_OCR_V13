@@ -1,158 +1,181 @@
 #!/usr/bin/env python3
 """
-Processing Limits - Límites de procesamiento centralizados
+Processing Limits - Límites de procesamiento centralizados.
 Configuración unificada de límites de la API de Mistral OCR.
 
 ÚNICO PUNTO DE VERDAD para todos los límites de procesamiento.
-Todos los módulos deben importar y usar estos valores.
 """
 
+import warnings
 from dataclasses import dataclass
+from functools import cached_property
+from typing import NamedTuple
+
+
+class LimitCheckResult(NamedTuple):
+    """Resultado de verificación de límites."""
+    within_limits: bool
+    exceeded: list[str]
 
 
 @dataclass(frozen=True)
 class ProcessingLimits:
     """
     Límites unificados para procesamiento OCR.
-
-    Estos valores representan los límites seguros para la API de Mistral OCR,
-    calculados con márgenes de seguridad para evitar rechazos.
-
-    Basado en límites de la API de Mistral:
-    - Tamaño máximo absoluto: 50 MB
-    - Páginas máximas absolutas: 150 páginas
-
-    Con factores de seguridad aplicados:
-    - Tamaño: 48 MB (96% del límite)
-    - Páginas: 135 (90% del límite)
+    
+    Límites absolutos de API Mistral (Actualizados según pruebas exitosas):
+    - Tamaño máximo: 100 MB
+    - Páginas máximas: 1000
+    
+    Los límites seguros se calculan aplicando factores de seguridad.
     """
-
-    # === LÍMITES ABSOLUTOS DE LA API (NO MODIFICAR) ===
-    API_MAX_SIZE_MB: float = 50.0
-    API_MAX_PAGES: int = 150
-
-    # === LÍMITES SEGUROS (CON MARGEN DE SEGURIDAD) ===
-    # Estos son los valores que DEBEN usarse en toda la aplicación
-    SAFE_MAX_SIZE_MB: float = 48.0      # 96% del límite (2MB de margen)
-    SAFE_MAX_PAGES: int = 135           # 90% del límite (15 páginas de margen)
-
+    
+    # === LÍMITES ABSOLUTOS DE LA API ===
+    API_MAX_SIZE_MB: float = 100.0
+    API_MAX_PAGES: int = 1000
+    
     # === FACTORES DE SEGURIDAD ===
-    SAFETY_FACTOR_SIZE: float = 0.96    # 4% de margen para tamaño
-    SAFETY_FACTOR_PAGES: float = 0.90   # 10% de margen para páginas
-
-    # === OVERHEAD DE PDF ===
-    PDF_OVERHEAD_MB: float = 0.5        # Overhead estimado al dividir PDFs
-
-    # === LÍMITES PARA VALIDACIONES ===
-    # Estos valores se usan en validaciones específicas
-    VALIDATION_SIZE_MB: float = SAFE_MAX_SIZE_MB
-    VALIDATION_PAGES: int = SAFE_MAX_PAGES
-
-    # === LÍMITES POR DEFECTO PARA PROCESAMIENTO ===
-    # Valores por defecto al procesar un archivo individual
-    DEFAULT_MAX_SIZE_MB: float = SAFE_MAX_SIZE_MB
-    DEFAULT_MAX_PAGES: int = SAFE_MAX_PAGES
-
-    # === LÍMITES PARA BATCH PROCESSING ===
-    # Al procesar múltiples archivos, usar límites más conservadores
-    BATCH_MAX_SIZE_MB: float = SAFE_MAX_SIZE_MB
-    BATCH_MAX_PAGES: int = SAFE_MAX_PAGES
-
-    # === WORKERS Y CONCURRENCIA ===
+    SAFETY_FACTOR_SIZE: float = 0.96
+    SAFETY_FACTOR_PAGES: float = 0.90
+    
+    # === CONCURRENCIA ===
     DEFAULT_WORKERS: int = 2
     MAX_WORKERS: int = 10
     MIN_WORKERS: int = 1
-
+    
     # === RATE LIMITING ===
-    DELAY_BETWEEN_REQUESTS_SECONDS: float = 2.0
+    DELAY_BETWEEN_REQUESTS: float = 2.0
     UPLOAD_URL_CACHE_MINUTES: int = 50
+    
+    # === PDF OVERHEAD ===
+    PDF_OVERHEAD_MB: float = 0.5        # Overhead estimado al dividir PDFs
+    
+    @cached_property
+    def safe_max_size_mb(self) -> float:
+        """Tamaño máximo seguro en MB (calculado dinámicamente)."""
+        return self.API_MAX_SIZE_MB * self.SAFETY_FACTOR_SIZE
+    
+    @cached_property
+    def safe_max_pages(self) -> int:
+        """Páginas máximas seguras (calculado dinámicamente)."""
+        return int(self.API_MAX_PAGES * self.SAFETY_FACTOR_PAGES)
+
+    def __getattr__(self, name: str):
+        """Manejo centralizado de alias deprecados para compatibilidad hacia atrás."""
+        aliases = {
+            'SAFE_MAX_SIZE_MB': 'safe_max_size_mb',
+            'SAFE_MAX_PAGES': 'safe_max_pages',
+            'VALIDATION_SIZE_MB': 'safe_max_size_mb',
+            'VALIDATION_PAGES': 'safe_max_pages',
+            'DEFAULT_MAX_SIZE_MB': 'safe_max_size_mb',
+            'DEFAULT_MAX_PAGES': 'safe_max_pages',
+            'BATCH_MAX_SIZE_MB': 'safe_max_size_mb',
+            'BATCH_MAX_PAGES': 'safe_max_pages',
+            'DELAY_BETWEEN_REQUESTS_SECONDS': 'DELAY_BETWEEN_REQUESTS',
+        }
+        
+        if name in aliases:
+            target = aliases[name]
+            # Emitir advertencia de deprecación
+            warnings.warn(
+                f"'{name}' está obsoleto. Use '{target}' en su lugar.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            return getattr(self, target)
+        
+        raise AttributeError(f"'{type(self).__name__}' objeto no tiene el atributo '{name}'")
+    
+    def is_within_limits(self, size_mb: float, pages: int) -> bool:
+        """Verifica si un archivo está dentro de los límites seguros."""
+        return size_mb <= self.safe_max_size_mb and pages <= self.safe_max_pages
+    
+    def check_limits(self, size_mb: float, pages: int) -> LimitCheckResult:
+        """
+        Verifica límites y retorna resultado detallado.
+        
+        Returns:
+            LimitCheckResult con estado y lista de excedencias.
+        """
+        exceeded = []
+        
+        if size_mb > self.safe_max_size_mb:
+            exceeded.append(
+                f"Tamaño: {size_mb:.1f} MB excede {self.safe_max_size_mb:.1f} MB"
+            )
+        
+        if pages > self.safe_max_pages:
+            exceeded.append(
+                f"Páginas: {pages} excede {self.safe_max_pages}"
+            )
+        
+        return LimitCheckResult(
+            within_limits=len(exceeded) == 0,
+            exceeded=exceeded
+        )
+    
+    def __str__(self) -> str:
+        """Representación legible de los límites."""
+        return (
+            f"Límites Mistral OCR:\n"
+            f"  Tamaño máximo seguro: {self.safe_max_size_mb:.1f} MB\n"
+            f"  Páginas máximas seguras: {self.safe_max_pages}\n"
+            f"  Workers por defecto: {self.DEFAULT_WORKERS}\n"
+            f"  (API absolutos: {self.API_MAX_SIZE_MB:.0f} MB / {self.API_MAX_PAGES} págs)"
+        )
 
 
 # === INSTANCIA GLOBAL ÚNICA ===
-# Usar esta instancia en toda la aplicación
 LIMITS = ProcessingLimits()
 
 
-# === FUNCIONES DE UTILIDAD ===
+# === FUNCIONES DE CONVENIENCIA (compatibilidad hacia atrás) ===
 
 def get_safe_limits() -> tuple[float, int]:
-    """
-    Retorna los límites seguros para procesamiento.
-
-    Returns:
-        tuple[float, int]: (max_size_mb, max_pages)
-    """
-    return LIMITS.SAFE_MAX_SIZE_MB, LIMITS.SAFE_MAX_PAGES
+    """Retorna (max_size_mb, max_pages) seguros."""
+    return LIMITS.safe_max_size_mb, LIMITS.safe_max_pages
 
 
 def is_within_limits(size_mb: float, pages: int) -> bool:
-    """
-    Verifica si un archivo está dentro de los límites seguros.
-
-    Args:
-        size_mb: Tamaño del archivo en MB
-        pages: Número de páginas
-
-    Returns:
-        bool: True si está dentro de límites, False en caso contrario
-    """
-    return (size_mb <= LIMITS.SAFE_MAX_SIZE_MB and
-            pages <= LIMITS.SAFE_MAX_PAGES)
+    """Verifica si está dentro de límites seguros."""
+    return LIMITS.is_within_limits(size_mb, pages)
 
 
 def get_exceeded_limits(size_mb: float, pages: int) -> list[str]:
-    """
-    Identifica qué límites fueron excedidos.
-
-    Args:
-        size_mb: Tamaño del archivo en MB
-        pages: Número de páginas
-
-    Returns:
-        list[str]: Lista de límites excedidos
-    """
-    exceeded = []
-
-    if size_mb > LIMITS.SAFE_MAX_SIZE_MB:
-        exceeded.append(
-            f"Tamaño ({size_mb:.1f} MB > {LIMITS.SAFE_MAX_SIZE_MB} MB)"
-        )
-
-    if pages > LIMITS.SAFE_MAX_PAGES:
-        exceeded.append(
-            f"Páginas ({pages} > {LIMITS.SAFE_MAX_PAGES})"
-        )
-
-    return exceeded
+    """Identifica qué límites fueron excedidos."""
+    return LIMITS.check_limits(size_mb, pages).exceeded
 
 
 def format_limits_info() -> str:
     """
     Formatea información sobre los límites para mostrar al usuario.
-
-    Returns:
-        str: Información formateada
+    Mantenida por compatibilidad.
     """
-    separator = "=" * 40
-    return f"""Limites de Procesamiento Mistral OCR:
-{separator}
-- Tamanio maximo: {LIMITS.SAFE_MAX_SIZE_MB} MB
-- Paginas maximas: {LIMITS.SAFE_MAX_PAGES} paginas
-- Workers por defecto: {LIMITS.DEFAULT_WORKERS}
-{separator}
-Nota: Limites con margen de seguridad aplicado.
-API absolutos: {LIMITS.API_MAX_SIZE_MB} MB / {LIMITS.API_MAX_PAGES} paginas"""
+    return str(LIMITS)
 
 
-# === VALIDACION DE IMPORTACION ===
 if __name__ == "__main__":
-    print("=== LIMITES DE PROCESAMIENTO MISTRAL OCR ===")
-    print()
-    print(format_limits_info())
-    print()
-    print("Limites seguros:", get_safe_limits())
-    print()
-    print("Ejemplo de validacion:")
-    print(f"  - Archivo de 45 MB, 120 paginas: {is_within_limits(45, 120)}")
-    print(f"  - Archivo de 55 MB, 100 paginas: {is_within_limits(55, 100)}")
-    print(f"    Excedidos: {get_exceeded_limits(55, 100)}")
+    # Configurar filtros para mostrar DeprecationWarnings en la prueba
+    warnings.simplefilter('always', DeprecationWarning)
+    
+    print("=== LÍMITES DE PROCESAMIENTO MISTRAL OCR ===\n")
+    print(LIMITS)
+    
+    print("\n--- Pruebas de Compatibilidad (Alias) ---")
+    try:
+        # Esto debería disparar una advertencia
+        print(f"Accediendo a LIMITS.SAFE_MAX_SIZE_MB (alias): {LIMITS.SAFE_MAX_SIZE_MB}")
+        print(f"Accediendo a LIMITS.DEFAULT_MAX_PAGES (alias): {LIMITS.DEFAULT_MAX_PAGES}")
+    except Exception as e:
+        print(f"Error en alias: {e}")
+        
+    print("\n--- Validaciones de ejemplo ---")
+    test_cases = [(45, 120), (55, 100), (48, 260)]
+    for size, pages in test_cases:
+        result = LIMITS.check_limits(size, pages)
+        status = "✓" if result.within_limits else "✗"
+        print(f"  {status} {size} MB, {pages} págs", end="")
+        if result.exceeded:
+            print(f" → {result.exceeded}")
+        else:
+            print()

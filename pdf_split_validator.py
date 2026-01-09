@@ -5,7 +5,9 @@ PDF Split Validator - Sistema de Validación y Ajuste Automático
 Sistema avanzado para validar y ajustar automáticamente la división de PDFs
 que exceden límites de tamaño, con interfaz interactiva.
 
-Versión: 2.0.0 - Sistema Completo Restaurado
+REFACTORIZADO: Ahora usa core_analyzer.py para eliminar código duplicado.
+
+Versión: 3.0.0 - Integrado con FileAnalyzer
 Funcionalidad: Validación post-división y re-división automática
 """
 
@@ -16,6 +18,8 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import logging
 import math
+from core_analyzer import FileAnalyzer, SplitLimits, FileMetrics
+from processing_limits import LIMITS
 
 # Configuración
 logging.basicConfig(level=logging.INFO)
@@ -67,11 +71,20 @@ class AdjustedSummary:
     adjustment_reason: str
 
 class PDFSplitValidator:
-    """Validador avanzado para división de PDFs con ajuste automático"""
-    
+    """
+    Validador avanzado para división de PDFs con ajuste automático
+
+    REFACTORIZADO: Usa FileAnalyzer de core_analyzer.py internamente.
+    """
+
     def __init__(self, max_size_mb: float = 49.5, max_pages: int = 1000):
         self.max_size_mb = max_size_mb
         self.max_pages = max_pages
+
+        # Usar FileAnalyzer internamente
+        self.limits = SplitLimits(max_size_mb=max_size_mb, max_pages=max_pages)
+        self.analyzer = FileAnalyzer(self.limits)
+
         logger.info(f"Validador inicializado: {max_size_mb}MB, {max_pages} páginas máx")
     
     def validate_split_files(self, split_info: Dict) -> ValidationSummary:
@@ -101,12 +114,18 @@ class PDFSplitValidator:
             if not file_path.exists():
                 logger.warning(f"Archivo no encontrado: {file_path}")
                 continue
-                
-            # Obtener información del archivo
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            
-            # Estimar páginas (si no está disponible, usar aproximación)
-            pages = split_info.get('pages_per_file', {}).get(idx, int(size_mb * 4))
+
+            # Usar FileAnalyzer para obtener métricas (elimina código duplicado)
+            try:
+                pages_hint = split_info.get('pages_per_file', {}).get(idx)
+                metrics = FileAnalyzer.get_file_metrics(file_path, pages_hint)
+                size_mb = metrics.size_mb
+                pages = metrics.total_pages
+            except Exception as e:
+                logger.warning(f"Error al analizar {file_path}: {e}")
+                # Fallback al cálculo manual
+                size_mb = file_path.stat().st_size / (1024 * 1024)
+                pages = split_info.get('pages_per_file', {}).get(idx, int(size_mb * 4))
             
             # Validar límites
             within_size_limit = size_mb <= self.max_size_mb
@@ -249,47 +268,50 @@ class PDFSplitValidator:
     def calculate_optimal_split(self, file_path: Path, target_size_mb: float = None) -> Dict:
         """
         Calcular división óptima para un archivo
-        
+
+        REFACTORIZADO: Usa FileAnalyzer de core_analyzer.py
+
         Args:
             file_path: Ruta del archivo
             target_size_mb: Tamaño objetivo por archivo (opcional)
-            
+
         Returns:
             Dict con información de división óptima
         """
         if not file_path.exists():
             raise FileNotFoundError(f"Archivo no encontrado: {file_path}")
-        
-        file_size_mb = file_path.stat().st_size / (1024 * 1024)
-        target_size = target_size_mb or self.max_size_mb
-        
-        # Cálculos de división óptima
-        min_files = math.ceil(file_size_mb / target_size)
-        optimal_size_per_file = file_size_mb / min_files
-        
-        # Generar múltiples opciones
+
+        # Usar FileAnalyzer para obtener métricas y análisis
+        metrics = FileAnalyzer.get_file_metrics(file_path)
+
+        # Crear límites temporales si se especifica target_size
+        if target_size_mb:
+            temp_limits = SplitLimits(max_size_mb=target_size_mb, max_pages=self.max_pages)
+            temp_analyzer = FileAnalyzer(temp_limits)
+        else:
+            temp_analyzer = self.analyzer
+            target_size_mb = self.max_size_mb
+
+        # Obtener análisis y planes alternativos
+        analysis = temp_analyzer.analyze_split_needs(metrics)
+        alternative_plans = temp_analyzer.get_alternative_plans(analysis)
+
+        # Convertir planes a formato dict para compatibilidad
         options = []
-        for num_files in range(min_files, min(min_files + 4, 20)):
-            size_per_file = file_size_mb / num_files
-            efficiency = min(1.0, target_size / size_per_file) if size_per_file > 0 else 0
-            
-            if size_per_file <= target_size:
-                options.append({
-                    'num_files': num_files,
-                    'size_per_file_mb': size_per_file,
-                    'efficiency': efficiency,
-                    'pages_per_file': int((file_size_mb * 4) / num_files),  # Estimación
-                    'total_size_mb': file_size_mb
-                })
-        
-        # Ordenar por eficiencia
-        options.sort(key=lambda x: x['efficiency'], reverse=True)
-        
+        for plan in alternative_plans:
+            options.append({
+                'num_files': plan.num_files,
+                'size_per_file_mb': plan.estimated_mb_per_file,
+                'efficiency': plan.efficiency_score,
+                'pages_per_file': plan.pages_per_file,
+                'total_size_mb': plan.total_size_mb
+            })
+
         return {
-            'original_size_mb': file_size_mb,
-            'target_size_mb': target_size,
-            'min_files_required': min_files,
-            'recommended_files': options[0]['num_files'] if options else min_files,
+            'original_size_mb': metrics.size_mb,
+            'target_size_mb': target_size_mb,
+            'min_files_required': analysis.required_files,
+            'recommended_files': options[0]['num_files'] if options else analysis.required_files,
             'options': options[:5]  # Top 5 opciones
         }
 
@@ -356,7 +378,7 @@ def test_validator():
         test_file = Path(tmp.name)
     
     try:
-        validator = PDFSplitValidator(max_size_mb=45.0)
+        validator = PDFSplitValidator(max_size_mb=LIMITS.SAFE_MAX_SIZE_MB)
         
         # Calcular división óptima
         optimal = validator.calculate_optimal_split(test_file)

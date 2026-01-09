@@ -229,16 +229,16 @@ class MistralOCRClient:
     
     # === Métodos principales ===
     
-    def process_url(self, url: str, model="mistral-ocr-latest", include_images=True):
+    def process_url(self, url: str, model="mistral-ocr-latest", include_images=True, **kwargs):
         """Procesa documento desde URL."""
         logger.info(f"Procesando URL: {url}")
         return self._process_document({
             "type": "document_url",
             "document_url": url
-        }, model, include_images)
+        }, model, include_images, **kwargs)
     
     def process_local_file(self, file_path: str, model="mistral-ocr-latest",
-                          include_images=True, max_size_mb=None):
+                          include_images=True, max_size_mb=None, **kwargs):
         """Procesa archivo local."""
         file_path = Path(file_path)
         # Usar límite centralizado si no se especifica
@@ -253,7 +253,7 @@ class MistralOCRClient:
         return self._process_document({
             "type": "document_url", 
             "document_url": file_url
-        }, model, include_images)
+        }, model, include_images, **kwargs)
     
     # === Métodos de guardado unificados ===
     
@@ -613,7 +613,8 @@ class MistralOCRClient:
             # CRÍTICO: Procesar tablas HTML (reemplazar placeholders tbl-X.html)
             # PROTECCIÓN: Si se va a optimizar, usamos tokens para proteger el HTML
             use_tokens = bool(optimizer)
-            page_content, token_map = _resolve_table_injections(page_content, page, use_tokens=use_tokens)
+            page_content, token_map = _resolve_table_injections(page_content, page, use_tokens=use_tokens)
+
 
             # Procesar imágenes (customizable)
             if image_processor_fn:
@@ -641,7 +642,7 @@ class MistralOCRClient:
 
         return "".join(content_parts)
 
-    def _process_document(self, document: Dict, model: str, include_images: bool):
+    def _process_document(self, document: Dict, model: str, include_images: bool, **kwargs):
         """
         Procesa documento con la API.
 
@@ -654,11 +655,10 @@ class MistralOCRClient:
         process_params = {
             "document": document,
             "model": model,
-            "include_image_base64": include_images
-            # NOTA: Parámetros no soportados en versión actual de Mistral API:
-            # "table_format": "html"
-            # "extract_header": True
-            # "extract_footer": True
+            "include_image_base64": include_images,
+            "table_format": kwargs.get("table_format", "html"),
+            "extract_header": kwargs.get("extract_header", False),
+            "extract_footer": kwargs.get("extract_footer", False)
         }
 
         # Agregar BBox annotations si esta habilitado
