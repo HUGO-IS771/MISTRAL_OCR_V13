@@ -602,7 +602,7 @@ class MistralOCRApp(ctk.CTk):
             row=1, column=2, padx=5, pady=5, sticky="w"
         )
         ctk.CTkOptionMenu(
-            frame, values=["general", "legal", "religious"],
+            frame, values=["general", "legal", "religious", "articulos"],
             variable=self.batch_vars['optimize']['domain']
         ).grid(row=1, column=3, padx=5, pady=5, sticky="w")
 
@@ -1086,7 +1086,10 @@ class MistralOCRApp(ctk.CTk):
             'save_json': 'json' in config.output_formats,
             'table_format': None if config.table_format == "none" else config.table_format,
             'extract_header': config.extract_header,
-            'extract_footer': config.extract_footer
+            'extract_footer': config.extract_footer,
+            # CRITICAL FIX: Pass optimization parameters
+            'optimize': config.optimize,
+            'optimization_domain': config.optimization_domain
         }
         
         # Process with optimizations
@@ -1170,7 +1173,9 @@ class MistralOCRApp(ctk.CTk):
                     self.ocr_client.save_as_markdown(
                         response, path, page_offset,
                         optimize=config.optimize,
-                        domain=config.optimization_domain
+                        domain=config.optimization_domain,
+                        extract_header=config.extract_header,
+                        extract_footer=config.extract_footer
                     )
                 
                 if 'txt' in config.output_formats:
@@ -1178,7 +1183,9 @@ class MistralOCRApp(ctk.CTk):
                     self.ocr_client.save_text(
                         response, path, page_offset,
                         optimize=config.optimize,
-                        domain=config.optimization_domain
+                        domain=config.optimization_domain,
+                        extract_header=config.extract_header,
+                        extract_footer=config.extract_footer
                     )
                 
                 if 'images' in config.output_formats:

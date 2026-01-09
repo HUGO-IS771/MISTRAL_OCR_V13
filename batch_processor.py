@@ -680,7 +680,7 @@ class OCRBatchProcessor:
             for save_type, filename in save_tasks:
                 future = save_executor.submit(
                     self._save_single_format,
-                    response, save_type, output_dir, filename, page_offset, base_name
+                    response, save_type, output_dir, filename, page_offset, config, base_name
                 )
                 save_futures[future] = (save_type, filename)
 
@@ -696,17 +696,34 @@ class OCRBatchProcessor:
         return saved_files
 
     def _save_single_format(self, response, save_type: str, output_dir: str,
-                           filename: str, page_offset: int, title: str = None) -> str:
+                           filename: str, page_offset: int, config: Dict, title: str = None) -> str:
         """Guarda un formato específico."""
         output_path = Path(output_dir) / filename
+        
+        # Obtener parámetros de optimización
+        optimize = config.get('optimize', False)
+        domain = config.get('optimization_domain', 'general')
+        extract_header = config.get('extract_header', False)
+        extract_footer = config.get('extract_footer', False)
 
         if save_type == 'md':
-            return self.ocr_client.save_as_markdown(response, output_path, page_offset)
+            return self.ocr_client.save_as_markdown(
+                response, output_path, page_offset, 
+                optimize=optimize, domain=domain,
+                extract_header=extract_header, extract_footer=extract_footer
+            )
         elif save_type == 'txt':
-            return self.ocr_client.save_text(response, output_path, page_offset)
+            return self.ocr_client.save_text(
+                response, output_path, page_offset,
+                optimize=optimize, domain=domain,
+                extract_header=extract_header, extract_footer=extract_footer
+            )
         elif save_type == 'html':
             doc_title = title.replace('_', ' ').title() if title else "Documento OCR"
-            return self.ocr_client.save_as_html(response, output_path, page_offset, title=doc_title)
+            return self.ocr_client.save_as_html(
+                response, output_path, page_offset, 
+                optimize=optimize, domain=domain, title=doc_title
+            )
         elif save_type == 'images':
             return self.ocr_client.save_images(response, output_path, page_offset)
         elif save_type == 'json':

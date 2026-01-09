@@ -258,13 +258,21 @@ class MistralOCRClient:
     # === Métodos de guardado unificados ===
     
     def save_as_markdown(self, ocr_response, output_path=None, page_offset=0,
-                        enrich_images=False, optimize=False, domain="general"):
-        """Método unificado para guardar markdown con análisis de calidad."""
+                        enrich_images=False, optimize=False, domain="general",
+                        extract_header=False, extract_footer=False):
+        """
+        Método unificado para guardar markdown con análisis de calidad.
+        
+        Args:
+            extract_header: Incluir headers de Mistral OCR 3
+            extract_footer: Incluir footers de Mistral OCR 3
+        """
         output_path = self._prepare_output_path(output_path, "md")
 
         # Generar contenido markdown
         content = self._generate_markdown_content(
-            ocr_response, page_offset, enrich_images, optimize, domain
+            ocr_response, page_offset, enrich_images, optimize, domain,
+            extract_header=extract_header, extract_footer=extract_footer
         )
 
         # Analizar calidad si se habilitó optimización
@@ -286,12 +294,35 @@ class MistralOCRClient:
         return output_path
     
     def save_text(self, ocr_response, output_path=None, page_offset=0,
-                  optimize=False, domain="general"):
-        """Guarda solo texto extraído."""
+                  optimize=False, domain="general", extract_header=False, extract_footer=False):
+        """
+        Guarda solo texto extraído, con optimización legal si se solicita.
+        
+        Args:
+            extract_header: Incluir headers de Mistral OCR 3
+            extract_footer: Incluir footers de Mistral OCR 3
+        """
         output_path = self._prepare_output_path(output_path, "txt")
-
-        # Usar get_text() para generar contenido
-        text_content = self.get_text(ocr_response, page_offset, optimize, domain)
+        
+        # IMPORTANTE: Para dominios legales, usar el mismo pipeline que Markdown
+        # para aplicar la optimización de documento completo
+        if optimize and domain in ["legal", "articulos"]:
+            # Usar el pipeline de markdown optimizado
+            # INCLUIR headers/footers si se solicitaron (igual que en Markdown)
+            markdown_content = self._process_pages_to_markdown(
+                ocr_response, page_offset, optimize=True, domain=domain,
+                page_header_fn=None,  # Sin headers de página para texto plano
+                image_processor_fn=None,
+                include_headers_footers=False,  # Se controla individualmente con extract_header/extract_footer
+                extract_header=extract_header,
+                extract_footer=extract_footer,
+                separator="\n\n"
+            )
+            # Convertir markdown a texto plano (quitar formato markdown pero mantener estructura)
+            text_content = self._extract_plain_text(markdown_content)
+        else:
+            # Para otros dominios, usar get_text() original
+            text_content = self.get_text(ocr_response, page_offset, optimize, domain)
 
         with open(output_path, "wt", encoding="utf-8") as f:
             f.write(text_content)
@@ -576,6 +607,8 @@ class MistralOCRClient:
                                    page_header_fn=None,
                                    image_processor_fn=None,
                                    include_headers_footers: bool = True,
+                                   extract_header: bool = None,
+                                   extract_footer: bool = None,
                                    separator: str = "\n\n") -> str:
         """
         Método base unificado para procesar páginas OCR a markdown.
@@ -593,8 +626,14 @@ class MistralOCRClient:
         Returns:
             str: Contenido markdown generado
         """
-        optimizer = MarkdownOptimizer(domain) if optimize else None
+        # Determinar si necesitamos optimización de documento completo (para legal/articulos)
+        needs_full_document_optimization = optimize and domain in ["legal", "articulos"]
+        
+        # Crear optimizador solo para dominios NO legales (optimización por página)
+        page_optimizer = MarkdownOptimizer(domain) if (optimize and not needs_full_document_optimization) else None
+        
         content_parts = []
+        all_token_maps = {}  # Para restaurar tablas después de optimización de doc completo
 
         for i, page in enumerate(ocr_response.pages):
             page_num = i + 1 + page_offset
@@ -604,7 +643,14 @@ class MistralOCRClient:
                 content_parts.append(page_header_fn(page_num))
 
             # Encabezado de documento (Mistral OCR 3)
-            if include_headers_footers and hasattr(page, 'header') and page.header:
+            # Respeta extract_header si se especifica, sino usa include_headers_footers
+            # IMPORTANTE: En dominios legales ('articulos', 'legal'), NO incluir el encabezado en el texto
+            # para mantener la continuidad, aunque se haya extraído (eliminado del body).
+            should_include_header = (extract_header if extract_header is not None else include_headers_footers)
+            if domain in ['legal', 'articulos']:
+                should_include_header = False
+                
+            if should_include_header and hasattr(page, 'header') and page.header:
                 content_parts.append(f"**Encabezado:** {page.header}\n\n")
 
             # Obtener contenido markdown
@@ -612,19 +658,21 @@ class MistralOCRClient:
 
             # CRÍTICO: Procesar tablas HTML (reemplazar placeholders tbl-X.html)
             # PROTECCIÓN: Si se va a optimizar, usamos tokens para proteger el HTML
-            use_tokens = bool(optimizer)
+            use_tokens = optimize  # Siempre usar tokens si hay optimización
             page_content, token_map = _resolve_table_injections(page_content, page, use_tokens=use_tokens)
-
+            
+            # Guardar token_map para restauración posterior
+            all_token_maps.update(token_map)
 
             # Procesar imágenes (customizable)
             if image_processor_fn:
                 page_content = image_processor_fn(page, page_content)
 
-            # Optimizar markdown (si aplica)
-            if optimizer:
-                page_content = optimizer.optimize_markdown(page_content)
+            # Optimizar markdown POR PÁGINA (solo para dominios NO legales)
+            if page_optimizer:
+                page_content = page_optimizer.optimize_markdown(page_content)
                 
-                # RESTAURAR tablas protegidas (reemplazar tokens con HTML real)
+                # RESTAURAR tablas protegidas
                 if token_map:
                     for token, html_content in token_map.items():
                         page_content = page_content.replace(token, html_content)
@@ -633,14 +681,37 @@ class MistralOCRClient:
             content_parts.append(page_content)
 
             # Pie de página de documento (Mistral OCR 3)
-            if include_headers_footers and hasattr(page, 'footer') and page.footer:
+            # Respeta extract_footer si se especifica, sino usa include_headers_footers
+            # IMPORTANTE: En dominios legales, NO incluir el pie de página
+            should_include_footer = (extract_footer if extract_footer is not None else include_headers_footers)
+            if domain in ['legal', 'articulos']:
+                should_include_footer = False
+                
+            if should_include_footer and hasattr(page, 'footer') and page.footer:
                 content_parts.append(f"\n\n**Pie de página:** {page.footer}")
 
             # Separador entre páginas
             if i < len(ocr_response.pages) - 1:
                 content_parts.append(separator)
 
-        return "".join(content_parts)
+        # Ensamblar documento
+        full_document = "".join(content_parts)
+        
+        # OPTIMIZACIÓN DE DOCUMENTO COMPLETO (para legal/articulos)
+        if needs_full_document_optimization:
+            logger.info(f"🔧 Aplicando optimización de documento completo para dominio: {domain}")
+            full_doc_optimizer = MarkdownOptimizer(domain)
+            logger.info(f"   Optimizer creado: {full_doc_optimizer}, legal_optimizer: {full_doc_optimizer.legal_optimizer}")
+            full_document = full_doc_optimizer.optimize_markdown(full_document)
+            logger.info(f"   Optimización completada. Longitud resultado: {len(full_document)} chars")
+            
+            # Restaurar TODAS las tablas protegidas
+            if all_token_maps:
+                for token, html_content in all_token_maps.items():
+                    full_document = full_document.replace(token, html_content)
+                logger.info(f"Documento completo: {len(all_token_maps)} tablas restauradas post-optimización legal")
+
+        return full_document
 
     def _process_document(self, document: Dict, model: str, include_images: bool, **kwargs):
         """
@@ -787,18 +858,30 @@ class MistralOCRClient:
         return path
     
     def _generate_markdown_content(self, ocr_response, page_offset: int,
-                                  enrich_images: bool, optimize: bool, domain: str) -> str:
-        """Genera contenido markdown según opciones."""
+                                  enrich_images: bool, optimize: bool, domain: str,
+                                  extract_header: bool = False, extract_footer: bool = False) -> str:
+        """
+        Genera contenido markdown según opciones.
+        
+        Args:
+            extract_header: Incluir headers de Mistral OCR 3
+            extract_footer: Incluir footers de Mistral OCR 3
+        """
         return self._process_pages_to_markdown(
             ocr_response, page_offset, optimize, domain,
             page_header_fn=lambda num: f"# Página {num}\n\n",
             image_processor_fn=lambda p, c: self._enrich_page_images(p, c, correct_mime=True) if enrich_images else c,
-            include_headers_footers=True,
+            include_headers_footers=False,  # Se controla individualmente con extract_header/extract_footer
+            extract_header=extract_header,
+            extract_footer=extract_footer,
             separator="\n\n"
         )
     
     def _extract_plain_text(self, markdown: str) -> str:
-        """Extrae texto plano de markdown."""
+        """
+        Extrae texto plano de markdown, preservando headers y footers de Mistral OCR 3.
+        Limpia el formato markdown pero mantiene el contenido estructurado.
+        """
         lines = []
         for line in markdown.splitlines():
             # Decodificar entidades HTML y limpiar tags
@@ -808,8 +891,15 @@ class MistralOCRClient:
             # Omitir imágenes
             if line.strip().startswith('!['):
                 continue
-            # Limpiar formato
-            line = re.sub(r'^#+\s*', '', line)  # Encabezados
+            
+            # PRESERVAR headers y footers de Mistral OCR 3 (convertir formato pero mantener contenido)
+            # **Encabezado:** texto -> Encabezado: texto
+            if '**Encabezado:**' in line or '**Pie de página:**' in line:
+                line = re.sub(r'\*\*Encabezado:\*\*', 'Encabezado:', line)
+                line = re.sub(r'\*\*Pie de página:\*\*', 'Pie de página:', line)
+            
+            # Limpiar formato markdown
+            line = re.sub(r'^#+\s*', '', line)  # Encabezados markdown (#, ##, etc.)
             line = re.sub(r'\*\*([^*]+)\*\*', r'\1', line)  # Negrita
             line = re.sub(r'\*([^*]+)\*', r'\1', line)  # Cursiva
             line = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', line)  # Enlaces

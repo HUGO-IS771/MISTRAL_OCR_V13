@@ -308,6 +308,13 @@ class MarkdownOptimizer(TextOptimizer):
                 logger.info("Formateador de documentos legales ACTIVADO (markdown)")
             except Exception as e:
                 logger.warning(f"Error inicializando formateador legal (markdown): {e}")
+        elif domain == "articulos" and LEGAL_FORMATTER_AVAILABLE:
+            try:
+                self.legal_optimizer = LegalTextOptimizer(style="articulos")
+                logger.info("Formateador de ARTÍCULOS ACTIVADO (con separadores)")
+            except Exception as e:
+                logger.warning(f"Error inicializando formateador de artículos: {e}")
+
 
         if self.detect_tables:
             try:
@@ -373,7 +380,39 @@ class MarkdownOptimizer(TextOptimizer):
                 text_to_optimize = "\n".join(lines)
 
         # 2. Structured legal formatting for full document
-        if self.domain == "legal" and self.legal_optimizer:
+        if (self.domain == "legal" or self.domain == "articulos") and self.legal_optimizer:
+            # PROTEGER headers y footers de Mistral OCR 3 antes de optimización legal
+            header_footer_placeholders = {}
+            
+            def _header_footer_replacer(match):
+                placeholder = f"<<<HEADER_FOOTER_{len(header_footer_placeholders)}>>>"
+                header_footer_placeholders[placeholder] = match.group(0)
+                logger.debug(f"Protegiendo header/footer: {match.group(0)[:50]}... -> {placeholder}")
+                return placeholder
+            
+            # Proteger líneas que contienen headers/footers de Mistral OCR 3
+            # SOLO proteger líneas que empiezan con **Encabezado:** o **Pie de página:**
+            # y capturar solo hasta el final de línea (evitar capturar múltiples líneas)
+            # Proteger líneas que contienen headers/footers de Mistral OCR 3
+            # MEJORADO: Capturar bloques COMPLETOS de Encabezado y Pie de página (multilínea)
+            
+            # Header: capturar desde **Encabezado:** hasta vacío o inicio de contenido
+            text_to_optimize = re.sub(
+                r'(\*\*Encabezado:\*\*.*?(?=\n\n(?!\*\*Pie de página:\*\*)|$))',
+                _header_footer_replacer,
+                text_to_optimize,
+                flags=re.DOTALL | re.MULTILINE 
+            )
+            
+            # Footer: capturar desde \n\n**Pie de página:** hasta el final del bloque
+            text_to_optimize = re.sub(
+                r'(\n\n\*\*Pie de página:\*\*.*?(?=\n\n|$))',
+                _header_footer_replacer,
+                text_to_optimize,
+                flags=re.DOTALL | re.MULTILINE
+            )
+
+            
             image_placeholders = {}
 
             def _image_replacer(match):
@@ -388,6 +427,16 @@ class MarkdownOptimizer(TextOptimizer):
             )
 
             optimized = self.legal_optimizer.optimize(text_to_optimize)
+            
+            # RESTAURAR headers y footers protegidos
+            logger.debug(f"Restaurando {len(header_footer_placeholders)} headers/footers protegidos")
+            # Restaurar directamente (método simple para evitar duplicaciones)
+            for placeholder, header_footer_content in header_footer_placeholders.items():
+                if placeholder in optimized:
+                    optimized = optimized.replace(placeholder, header_footer_content)
+                    logger.debug(f"Restaurado placeholder {placeholder}")
+                else:
+                    logger.debug(f"Placeholder {placeholder} no encontrado en resultado optimizado")
 
             for placeholder, table_markdown in protected_tables.items():
                 optimized = re.sub(
